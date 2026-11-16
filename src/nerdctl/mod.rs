@@ -981,6 +981,17 @@ impl<R: CommandRunner> DockerOps for Nerdctl<R> {
             .create(&without_ports, &trial, trial_image, &spec.image_ref)
             .await
         {
+            // A create that failed, or was killed at its time limit, may
+            // already have made the container: nerdctl records it before
+            // setting up its network. The sweep only removes leftovers of a
+            // freshdock that is gone, so remove it now.
+            match self.call(&["rm", "--force", &trial]).await {
+                Ok(_) => debug!(container = %trial, "removed the trial a failed create left"),
+                Err(e) if e.is_not_found() => {}
+                Err(e) => {
+                    warn!(container = %trial, error = %e, "could not remove the trial container; remove it by hand")
+                }
+            }
             return Err(DockerError::Unsupported(format!(
                 "nerdctl rejected {}'s rebuilt settings, so it was not updated: {e}",
                 spec.name
@@ -1439,9 +1450,16 @@ mod tests {
         docker_configs: Mutex<Vec<String>>,
         /// `(path, contents)` of each `--env-file`, read during the call.
         env_files: Mutex<Vec<(String, String)>>,
+        /// Calls that run into their time limit.
+        timeouts: Vec<String>,
     }
 
     impl FakeRunner {
+        fn times_out(mut self, args: &str) -> Self {
+            self.timeouts.push(args.to_owned());
+            self
+        }
+
         fn on(mut self, args: &str, out: CmdOutput) -> Self {
             self.script.push((args.to_owned(), out));
             self
@@ -1464,7 +1482,7 @@ mod tests {
             &self,
             args: &[String],
             env: &[(String, String)],
-            _timeout: Duration,
+            timeout: Duration,
         ) -> Result<CmdOutput, RunError> {
             assert_eq!(args[..2], ["--namespace".to_owned(), NS.to_owned()]);
             let call = args[2..].join(" ");
@@ -1480,6 +1498,12 @@ mod tests {
                 self.env_files.lock().unwrap().push((path, contents));
             }
             self.calls.lock().unwrap().push(call.clone());
+            if self.timeouts.iter().any(|want| glob_match(want, &call)) {
+                return Err(RunError::TimedOut {
+                    bin: "nerdctl".to_owned(),
+                    timeout,
+                });
+            }
             // One-shot replies first, in order, then the standing ones.
             let mut once = self.once.lock().unwrap();
             if let Some(i) = once.iter().position(|(want, _)| glob_match(want, &call)) {
@@ -2432,10 +2456,15 @@ mod tests {
 
     #[tokio::test]
     async fn preflight_refuses_when_nerdctl_rejects_the_trial_create() {
-        let n = nerdctl(inspectable("fd-full", "full").on(
-            "create --name fd-full-freshdock-check-* *",
-            fail("time=\"t\" level=fatal msg=\"failed to parse volume options\"\n"),
-        ));
+        let n = nerdctl(
+            inspectable("fd-full", "full")
+                .on(
+                    "create --name fd-full-freshdock-check-* *",
+                    fail("time=\"t\" level=fatal msg=\"failed to parse volume options\"\n"),
+                )
+                // Rejected before anything was made: nothing to remove.
+                .on("rm --force fd-full-freshdock-check-*", fail(NOT_FOUND)),
+        );
         let spec = n.inspect("fd-full").await.unwrap();
         let err = n.preflight_recreate(&spec).await.unwrap_err();
         assert!(matches!(err, DockerError::Unsupported(_)), "{err}");
@@ -2443,9 +2472,25 @@ mod tests {
             err.to_string().contains("failed to parse volume options"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_trial_create_that_timed_out_is_removed() {
+        let n = nerdctl(
+            inspectable("fd-full", "full")
+                .times_out("create --name fd-full-freshdock-check-* *")
+                // The container was recorded before nerdctl was killed.
+                .on("rm --force fd-full-freshdock-check-*", ok("")),
+        );
+        let spec = n.inspect("fd-full").await.unwrap();
+        let err = n.preflight_recreate(&spec).await.unwrap_err();
+        assert!(matches!(err, DockerError::Unsupported(_)), "{err}");
+        let calls = n.runner.calls();
+        let create = calls.iter().find(|c| c.starts_with("create ")).unwrap();
+        let trial = create.split(' ').nth(2).unwrap();
         assert!(
-            !n.runner.calls().iter().any(|c| c.starts_with("rm")),
-            "a failed create leaves nothing to remove"
+            calls.contains(&format!("rm --force {trial}")),
+            "the trial that create named is removed: {calls:?}"
         );
     }
 
