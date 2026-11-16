@@ -741,6 +741,42 @@ impl<R: CommandRunner> Nerdctl<R> {
             })
     }
 
+    /// Refuse to update `owner` when a container sharing its network namespace
+    /// has settings freshdock can't reproduce. Such a dependent has to be
+    /// re-created after the owner's update to join the new namespace (see
+    /// `reattach_dependents`), which happens after the owner's stop, without a
+    /// preflight of its own: its create would be refused only once it had
+    /// been stopped, leaving it with no network.
+    ///
+    /// A listing that fails is left to the update itself, which lists the
+    /// dependents again and carries on without them, as it would anyway.
+    async fn refuse_unreproducible_dependents(&self, owner: &str) -> Result<(), DockerError> {
+        let dependents = match self.list_network_dependents(owner).await {
+            Ok(dependents) => dependents,
+            Err(e) => {
+                debug!(container = %owner, error = %e, "could not list network-namespace dependents before the update");
+                return Ok(());
+            }
+        };
+        for dependent in dependents {
+            let spec = match self.inspect(&dependent).await {
+                Ok(spec) => spec,
+                Err(e) if e.is_not_found() => continue,
+                Err(e) => return Err(e),
+            };
+            let unsupported = &spec.nerdctl()?.unsupported;
+            if !unsupported.is_empty() {
+                return Err(DockerError::Unsupported(format!(
+                    "{owner} shares its network namespace with {dependent}, which would have to \
+                     be re-created after the update but has settings freshdock can't reproduce \
+                     with nerdctl, so {owner} was not updated: {}",
+                    unsupported.join("; ")
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Where the trial container's runtime spec and labels differ from the
     /// original's (see [`compare`]).
     async fn compare_with_trial(
@@ -964,6 +1000,7 @@ impl<R: CommandRunner> DockerOps for Nerdctl<R> {
     async fn preflight_recreate(&self, spec: &ContainerSpec) -> Result<(), DockerError> {
         let nerdctl = spec.nerdctl()?;
         refuse_unsupported(&spec.name, nerdctl)?;
+        self.refuse_unreproducible_dependents(&spec.name).await?;
         let trial = format!("{}{CHECK_MARKER}{}", spec.name, unique_suffix());
         let without_ports = NerdctlSpec {
             ports: Vec::new(),
@@ -2391,6 +2428,9 @@ mod tests {
                 &format!("image inspect {IMAGE}"),
                 ok(fixture("nerdctl_image_inspect.json")),
             )
+            // No other container shares its network namespace. (A test that
+            // wants one lists it with `on_once`, which comes first.)
+            .on("ps --no-trunc -q", ok(""))
     }
 
     #[test]
@@ -2882,6 +2922,65 @@ mod tests {
             n.list_network_dependents("fd-plain").await.unwrap(),
             ["fd-netdep"]
         );
+    }
+
+    /// fd-plain, whose network namespace fd-netdep shares; fd-netdep's own
+    /// environment is `netdep_env`.
+    fn owner_with_dependent(netdep_env: serde_json::Value) -> FakeRunner {
+        let mut netdep: Vec<serde_json::Value> =
+            serde_json::from_str(&fixture("nerdctl_netdep_inspect.json")).unwrap();
+        netdep[0]["Config"]["Env"] = netdep_env;
+        let netdep = serde_json::to_string(&netdep).unwrap();
+        inspectable("fd-plain", "plain")
+            .on_once("ps --no-trunc -q", ok(format!("{PLAIN_ID}\n{NETDEP_ID}\n")))
+            .on(
+                &format!("inspect {PLAIN_ID} {NETDEP_ID}"),
+                ok(joined(&fixture("nerdctl_plain_inspect.json"), &netdep)),
+            )
+            .on("inspect fd-netdep", ok(netdep))
+            .on(
+                "inspect --mode=native fd-netdep",
+                ok(fixture("nerdctl_netdep_native.json")),
+            )
+            .on("image inspect *", ok(fixture("nerdctl_image_inspect.json")))
+    }
+
+    #[tokio::test]
+    async fn an_owner_is_not_updated_when_its_dependent_cant_be_recreated() {
+        let n = nerdctl(owner_with_dependent(serde_json::json!([
+            "PATH=/bin",
+            "CERT=line one\nline two"
+        ])));
+        let spec = n.inspect("fd-plain").await.unwrap();
+        let err = n.preflight_recreate(&spec).await.unwrap_err();
+        assert!(matches!(err, DockerError::Unsupported(_)), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("fd-netdep"), "{msg}");
+        assert!(msg.contains("CERT has a multi-line value"), "{msg}");
+        assert!(!msg.contains("line one"), "no value is printed: {msg}");
+        assert!(
+            !n.runner.calls().iter().any(|c| c.starts_with("create ")),
+            "refused before even the trial"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_owner_with_a_reproducible_dependent_goes_ahead() {
+        let n = nerdctl(
+            owner_with_dependent(serde_json::json!(["PATH=/bin"]))
+                .on(
+                    "create --name fd-plain-freshdock-check-* *",
+                    ok("trialid\n"),
+                )
+                .on(
+                    "inspect --mode=native fd-plain-freshdock-check-*",
+                    ok(fixture("nerdctl_plain_native.json")),
+                )
+                .on("rm --force fd-plain-freshdock-check-*", ok("")),
+        );
+        let spec = n.inspect("fd-plain").await.unwrap();
+        n.preflight_recreate(&spec).await.unwrap();
+        assert!(n.runner.calls().contains(&"inspect fd-netdep".to_owned()));
     }
 
     #[tokio::test]
