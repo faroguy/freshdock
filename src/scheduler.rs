@@ -2369,15 +2369,32 @@ mod tests {
     async fn a_failed_probe_does_not_rearm_the_unknown_digest_warning() {
         let node = FakeNode::with_digests(vec![live_labels_for("app", "built:1")], &[]);
         let online = FakeRegistry::new(DIG_A);
+        let offline = FakeRegistry::offline();
+        // With a digest, so the probe reaches the registry and fails there;
+        // without one it would stop at "local build" before asking.
+        let known = LocalImage {
+            id: None,
+            repo_digests: vec![format!("built@{DIG_A}")],
+            source_unknown: false,
+        };
         let mut st = TickState::default();
         let out = capture_logs(async {
             let cfg = every_tick();
             let settings = ResolvedSettings::default;
             one_tick_cfg(&node, &online, &cfg, settings(), &mut st).await;
-            one_tick_cfg(&node, &FakeRegistry::offline(), &cfg, settings(), &mut st).await;
+            node.images
+                .lock()
+                .unwrap()
+                .insert("built:1".to_owned(), known);
+            one_tick_cfg(&node, &offline, &cfg, settings(), &mut st).await;
+            node.images.lock().unwrap().clear();
             one_tick_cfg(&node, &online, &cfg, settings(), &mut st).await;
         })
         .await;
+        assert!(
+            offline.calls.load(Ordering::SeqCst) > 0,
+            "the middle tick's probe reached the registry and failed"
+        );
         assert_eq!(out.matches("no local digest").count(), 1, "{out}");
     }
 
