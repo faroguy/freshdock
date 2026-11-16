@@ -8,7 +8,8 @@
 //! - `nerdctl inspect --mode=native`: the working directory and terminal, which
 //!   the compatible output leaves out;
 //! - `network-config.json` in the container's state directory: the published
-//!   ports, which inspect only reports while the container is running.
+//!   ports, which inspect only reports while the container is running (the
+//!   `nerdctl/ports` label holds them for containers nerdctl 1.x made).
 //!
 //! A setting freshdock cannot reproduce is recorded in
 //! [`NerdctlSpec::unsupported`] instead of being dropped, and the update is
@@ -103,6 +104,13 @@ pub struct CreateInspect {
     pub config: Option<CreateConfig>,
     pub host_config: Option<Map<String, Value>>,
     pub network_settings: Option<NetworkSettings>,
+    pub state: Option<CreateState>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CreateState {
+    pub running: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -204,6 +212,29 @@ pub struct OciLinux {
     /// Present unless the container runs unconfined.
     pub seccomp: Option<Value>,
     pub namespaces: Option<Vec<OciNamespace>>,
+    /// `<parent>:nerdctl:<id>` (systemd), or `<parent>/<id>` (cgroupfs).
+    #[serde(rename = "cgroupsPath")]
+    pub cgroups_path: Option<String>,
+}
+
+/// The parent a systemd-managed container lands in unless told otherwise.
+const DEFAULT_CGROUP_SLICE: &str = "system.slice";
+
+/// The `--cgroup-parent` a container was created with, read back from its
+/// cgroups path; `None` for the default parent. The compatible inspect has no
+/// field for it. A path in another shape is left to preflight's comparison of
+/// the two paths, which refuses the update when they differ.
+fn cgroup_parent(path: &str, id: &str, namespace: Option<&str>) -> Option<String> {
+    if id.is_empty() {
+        return None;
+    }
+    if let Some(slice) = path.strip_suffix(&format!(":nerdctl:{id}")) {
+        return (!slice.is_empty() && slice != DEFAULT_CGROUP_SLICE).then(|| slice.to_owned());
+    }
+    // cgroupfs: containerd puts a container in /<namespace> by default.
+    let parent = path.strip_suffix(&format!("/{id}"))?;
+    let default = namespace.map(|ns| format!("/{ns}"));
+    (!parent.is_empty() && Some(parent) != default.as_deref()).then(|| parent.to_owned())
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -288,10 +319,28 @@ impl NerdctlSpec {
             .get("nerdctl/networks")
             .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
             .unwrap_or_default();
-        spec.ports = ports(&compat, network_config.as_ref());
+        match ports(&compat, network_config.as_ref()) {
+            Some(ports) => spec.ports = ports,
+            None => spec.unsupported.push(
+                "published ports: nerdctl's network-config.json is unreadable, there is no \
+                 nerdctl/ports label, and the container is not running, so inspect lists none"
+                    .to_owned(),
+            ),
+        }
 
         let oci = native.spec.unwrap_or_default();
         spec.security_and_namespaces(&oci);
+        if let Some(parent) = oci
+            .linux
+            .as_ref()
+            .and_then(|l| l.cgroups_path.as_deref())
+            .and_then(|p| {
+                let namespace = spec.labels.get("nerdctl/namespace").map(String::as_str);
+                cgroup_parent(p, &id, namespace)
+            })
+        {
+            push(&mut spec.flags, "--cgroup-parent", parent);
+        }
         let process = oci.process.unwrap_or_default();
         if process.terminal == Some(true) {
             spec.flags.push("--tty".to_owned());
@@ -665,6 +714,12 @@ impl NerdctlSpec {
     }
 
     fn host_config(&mut self, mut hc: Map<String, Value>) {
+        // Taken before the "not set" filter below: a swappiness of 0 (never
+        // swap) is a setting, not the absence of one. Unset reads as null, or
+        // -1 in some versions.
+        let swappiness = hc
+            .remove("MemorySwappiness")
+            .filter(|v| !v.is_null() && v.as_i64() != Some(-1));
         let mut take = |key: &str| hc.remove(key).filter(|v| !is_empty(v));
 
         // Reproduced elsewhere, or set by nerdctl itself. `GroupAdd` lists the
@@ -799,7 +854,6 @@ impl NerdctlSpec {
             ("Memory", "--memory"),
             ("MemorySwap", "--memory-swap"),
             ("MemoryReservation", "--memory-reservation"),
-            ("MemorySwappiness", "--memory-swappiness"),
             ("CpuQuota", "--cpu-quota"),
             ("CpuPeriod", "--cpu-period"),
             ("CpuShares", "--cpu-shares"),
@@ -813,14 +867,23 @@ impl NerdctlSpec {
             ("UTSMode", "--uts"),
         ] {
             if let Some(v) = take(key) {
-                // -1 is the "unset" value for swappiness and swap.
-                if v.as_i64() == Some(-1) {
+                // -1 reads as "unset" for these, except swap, where it means
+                // unlimited: an unset swap limit reads as twice the memory.
+                if v.as_i64() == Some(-1) && key != "MemorySwap" {
                     continue;
                 }
                 match value_string(&v) {
                     Some(s) => push(&mut self.flags, flag, s),
                     None => self.unsupported.push(format!("HostConfig.{key} = {v}")),
                 }
+            }
+        }
+        if let Some(v) = swappiness {
+            match value_string(&v) {
+                Some(s) => push(&mut self.flags, "--memory-swappiness", s),
+                None => self
+                    .unsupported
+                    .push(format!("HostConfig.MemorySwappiness = {v}")),
             }
         }
         for (key, flag) in [
@@ -895,11 +958,18 @@ impl NerdctlSpec {
     }
 }
 
-/// Published ports: `network-config.json` when readable, else inspect's view
-/// of a running container.
-fn ports(compat: &CreateInspect, network_config: Option<&NetworkConfig>) -> Vec<String> {
-    if let Some(mappings) = network_config.and_then(|n| n.port_mappings.as_ref()) {
-        return mappings
+/// Published ports, from the first source that has them:
+/// `network-config.json`; the `nerdctl/ports` label (where nerdctl before 2.0
+/// kept them, and still reads them from); inspect's view, which lists them
+/// only while the container is running.
+///
+/// `None` when none of these can tell: the file is unreadable, there is no
+/// label, and the container is not running. An empty list then could be ports
+/// lost, and preflight leaves ports out of its comparison, so it would not
+/// notice.
+fn ports(compat: &CreateInspect, network_config: Option<&NetworkConfig>) -> Option<Vec<String>> {
+    let render = |mappings: &[PortMapping]| {
+        mappings
             .iter()
             .filter_map(|m| {
                 let host_port = m.host_port?;
@@ -909,7 +979,25 @@ fn ports(compat: &CreateInspect, network_config: Option<&NetworkConfig>) -> Vec<
                 let host_ip = publish_ip(host_ip);
                 Some(format!("{host_ip}:{host_port}:{container_port}/{protocol}"))
             })
-            .collect();
+            .collect()
+    };
+    if let Some(mappings) = network_config.and_then(|n| n.port_mappings.as_ref()) {
+        return Some(render(mappings));
+    }
+    let label = compat
+        .config
+        .as_ref()
+        .and_then(|c| c.labels.as_ref())
+        .and_then(|l| l.get("nerdctl/ports"));
+    if let Some(raw) = label {
+        // An unreadable label is as good as none: fall through.
+        if let Ok(mappings) = serde_json::from_str::<Vec<PortMapping>>(raw) {
+            return Some(render(&mappings));
+        }
+    }
+    let stopped = compat.state.as_ref().and_then(|s| s.running) == Some(false);
+    if stopped && network_config.is_none() {
+        return None;
     }
     let mut ports: Vec<String> = compat
         .network_settings
@@ -931,7 +1019,7 @@ fn ports(compat: &CreateInspect, network_config: Option<&NetworkConfig>) -> Vec<
         })
         .collect();
     ports.sort();
-    ports
+    Some(ports)
 }
 
 /// A host IP as `--publish` takes it: IPv6 in brackets, or its colons would be
@@ -1089,12 +1177,6 @@ mod tests {
             !got.iter().any(|a| a.contains("nerdctl/")),
             "runtime labels are not passed"
         );
-    }
-
-    #[test]
-    fn ports_fall_back_to_nothing_without_the_network_config_of_a_stopped_container() {
-        // fd-full was captured while restarting, so inspect had no ports.
-        assert!(spec_from("full", false).ports.is_empty());
     }
 
     #[test]
@@ -1303,7 +1385,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            ports(&CreateInspect::default(), Some(&config)),
+            ports(&CreateInspect::default(), Some(&config)).unwrap(),
             [
                 "[::1]:18097:80/tcp",
                 "[::]:18098:80/udp",
@@ -1311,10 +1393,45 @@ mod tests {
             ]
         );
         let running: CreateInspect = serde_json::from_str(
-            r#"{"NetworkSettings":{"Ports":{"80/tcp":[{"HostIp":"::1","HostPort":"18097"}]}}}"#,
+            r#"{"State":{"Running":true},
+                "NetworkSettings":{"Ports":{"80/tcp":[{"HostIp":"::1","HostPort":"18097"}]}}}"#,
         )
         .unwrap();
-        assert_eq!(ports(&running, None), ["[::1]:18097:80/tcp"]);
+        assert_eq!(ports(&running, None).unwrap(), ["[::1]:18097:80/tcp"]);
+    }
+
+    #[test]
+    fn ports_come_from_the_legacy_label_without_a_network_config() {
+        // nerdctl before 2.0 kept them only in this label (gocni's shape).
+        let stopped: CreateInspect = serde_json::from_str(
+            r#"{"State":{"Running":false},"Config":{"Labels":{"nerdctl/ports":
+                "[{\"HostPort\":18080,\"ContainerPort\":80,\"Protocol\":\"tcp\",\"HostIP\":\"127.0.0.1\"}]"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(ports(&stopped, None).unwrap(), ["127.0.0.1:18080:80/tcp"]);
+        // network-config.json still comes first.
+        let config: NetworkConfig =
+            serde_json::from_str(r#"{"portMappings":[{"HostPort":9,"ContainerPort":9}]}"#).unwrap();
+        assert_eq!(ports(&stopped, Some(&config)).unwrap(), ["0.0.0.0:9:9/tcp"]);
+    }
+
+    #[test]
+    fn ports_nothing_can_tell_are_refused_not_dropped() {
+        // fd-full was captured while restarting, so inspect had no ports, and
+        // without its network-config.json nothing else records them.
+        let spec = spec_from("full", false);
+        assert!(spec.ports.is_empty());
+        assert_eq!(spec.unsupported.len(), 1, "{:?}", spec.unsupported);
+        assert!(spec.unsupported[0].starts_with("published ports:"));
+        // A running container's inspect is enough, and so is a readable
+        // network-config.json that lists none.
+        assert!(spec_from("cmd", false).unsupported.is_empty());
+        let stopped: CreateInspect =
+            serde_json::from_str(r#"{"State":{"Running":false}}"#).unwrap();
+        assert_eq!(
+            ports(&stopped, Some(&NetworkConfig::default())).unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -1380,6 +1497,102 @@ mod tests {
         let none = with_health(r#"{"Test":["NONE"]}"#);
         assert!(none.unsupported.is_empty());
         assert!(none.flags.contains(&"--no-healthcheck".to_owned()));
+    }
+
+    fn with_host_config(hc: Value) -> NerdctlSpec {
+        NerdctlSpec::from_inspect(
+            CreateInspect {
+                host_config: Some(serde_json::from_value(hc).unwrap()),
+                ..Default::default()
+            },
+            NativeInspect::default(),
+            None,
+        )
+    }
+
+    #[test]
+    fn zero_swappiness_and_unlimited_swap_are_settings() {
+        // As nerdctl 2.3.4 records `--memory 64m --memory-swappiness 0
+        // --memory-swap -1`.
+        let spec = with_host_config(serde_json::json!({
+            "Memory": 67108864, "MemorySwap": -1, "MemorySwappiness": 0
+        }));
+        assert!(spec.unsupported.is_empty(), "{:?}", spec.unsupported);
+        let got = pairs(&spec.flags);
+        for want in [
+            "--memory 67108864",
+            "--memory-swap -1",
+            "--memory-swappiness 0",
+        ] {
+            assert!(
+                got.contains(&want.to_owned()),
+                "missing {want:?} in {got:?}"
+            );
+        }
+        // Left unset (`--memory 64m` alone): swap reads as twice the memory,
+        // swappiness as null (or -1), and no swappiness flag is passed.
+        for unset in [Value::Null, Value::from(-1)] {
+            let spec = with_host_config(serde_json::json!({
+                "Memory": 67108864, "MemorySwap": 134217728, "MemorySwappiness": unset
+            }));
+            assert!(spec.unsupported.is_empty(), "{:?}", spec.unsupported);
+            let got = pairs(&spec.flags);
+            assert!(
+                got.contains(&"--memory-swap 134217728".to_owned()),
+                "{got:?}"
+            );
+            assert!(
+                !got.iter().any(|f| f.starts_with("--memory-swappiness")),
+                "{got:?}"
+            );
+        }
+        let spec = with_host_config(serde_json::json!({"MemorySwappiness": 60}));
+        assert_eq!(spec.flags, ["--memory-swappiness", "60"]);
+    }
+
+    #[test]
+    fn a_custom_cgroup_parent_is_carried_over() {
+        const ID: &str = "1e4a0355a9f05d3840cec04cdffcd136c9b73d3036783a60fa04221f3f8ea359";
+        let with_path = |path: &str| {
+            let mut labels = HashMap::new();
+            labels.insert("nerdctl/namespace".to_owned(), "default".to_owned());
+            let native: NativeInspect = serde_json::from_value(serde_json::json!({
+                "Spec": {"linux": {"cgroupsPath": path}}
+            }))
+            .unwrap();
+            NerdctlSpec::from_inspect(
+                CreateInspect {
+                    id: Some(ID.to_owned()),
+                    config: Some(CreateConfig {
+                        labels: Some(labels),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                native,
+                None,
+            )
+        };
+        let parent = |path: &str| {
+            let spec = with_path(path);
+            let got = pairs(&spec.flags);
+            got.iter()
+                .find_map(|f| f.strip_prefix("--cgroup-parent ").map(str::to_owned))
+        };
+        // As nerdctl 2.3.4 records `--cgroup-parent freshdock-cr.slice` (systemd).
+        assert_eq!(
+            parent(&format!("freshdock-cr.slice:nerdctl:{ID}")).as_deref(),
+            Some("freshdock-cr.slice")
+        );
+        assert_eq!(parent(&format!("system.slice:nerdctl:{ID}")), None);
+        // cgroupfs: the namespace's own group is the default.
+        assert_eq!(parent(&format!("/default/{ID}")), None);
+        assert_eq!(
+            parent(&format!("/limits/batch/{ID}")).as_deref(),
+            Some("/limits/batch")
+        );
+        // Another shape: left to preflight's comparison.
+        assert_eq!(parent("custom-path"), None);
     }
 
     #[test]

@@ -79,12 +79,14 @@ fn normalize(native: &Value, id: &str) -> Value {
             drop_per_container(annotations);
             forget_cid_file(annotations);
         }
-        if let Some(Value::Object(linux)) = s.get_mut("linux") {
-            linux.remove("cgroupsPath");
-            if let Some(Value::Array(namespaces)) = linux.get_mut("namespaces") {
-                for ns in namespaces.iter_mut().filter_map(Value::as_object_mut) {
-                    ns.remove("path");
-                }
+        // `linux.cgroupsPath` stays: it names the container's cgroup parent
+        // (`--cgroup-parent`), and its per-container part is the id, which
+        // `replace_ids` turns into a placeholder.
+        if let Some(Value::Object(linux)) = s.get_mut("linux")
+            && let Some(Value::Array(namespaces)) = linux.get_mut("namespaces")
+        {
+            for ns in namespaces.iter_mut().filter_map(Value::as_object_mut) {
+                ns.remove("path");
             }
         }
         // Mount sources in nerdctl's state (resolv.conf, hosts, hostname) are
@@ -351,6 +353,27 @@ mod tests {
             ),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn a_lost_cgroup_parent_is_reported() {
+        let original = native(
+            ID_A,
+            json!({"Spec": {"linux": {"cgroupsPath": format!("limits.slice:nerdctl:{ID_A}")}}}),
+        );
+        let trial = native(ID_B, json!({}));
+        assert_eq!(
+            differences(&original, ID_A, &trial, ID_B),
+            [
+                "Spec.linux.cgroupsPath would change from \"limits.slice:nerdctl:ID\" to \"system.slice:nerdctl:ID\""
+            ]
+        );
+        // The same parent matches: only the id differs, and that is ignored.
+        let same = native(
+            ID_B,
+            json!({"Spec": {"linux": {"cgroupsPath": format!("limits.slice:nerdctl:{ID_B}")}}}),
+        );
+        assert!(differences(&original, ID_A, &same, ID_B).is_empty());
     }
 
     #[test]

@@ -2135,11 +2135,19 @@ mod tests {
         }
     }
 
+    /// A container freshdock is about to update: running, as every container
+    /// it lists is. (fd-full was captured while restarting.)
     fn inspectable(name: &str, fixture_name: &str) -> FakeRunner {
+        let mut compat: Vec<serde_json::Value> =
+            serde_json::from_str(&fixture(&format!("nerdctl_{fixture_name}_inspect.json")))
+                .unwrap();
+        compat[0]["State"]["Running"] = serde_json::Value::Bool(true);
+        compat[0]["State"]["Restarting"] = serde_json::Value::Bool(false);
+        compat[0]["State"]["Status"] = serde_json::Value::from("running");
         FakeRunner::default()
             .on(
                 &format!("inspect {name}"),
-                ok(fixture(&format!("nerdctl_{fixture_name}_inspect.json"))),
+                ok(serde_json::to_string(&compat).unwrap()),
             )
             .on(
                 &format!("inspect --mode=native {name}"),
