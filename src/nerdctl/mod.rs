@@ -85,6 +85,12 @@ pub struct Nerdctl<R = ProcessRunner> {
     /// pull moves the tag there is no other way to tell which image a sibling
     /// on the same tag still runs. See [`Seen`].
     seen: std::sync::Mutex<HashMap<String, Seen>>,
+    /// Listed containers whose image could not be looked up yet, by id, with
+    /// the reference they run. Not in `seen`, so the lookup is tried again on
+    /// the next pass; until it succeeds, nothing that could hide their image
+    /// happens: no pull moves that tag, and no image of that repository is
+    /// released or removed.
+    unidentified: std::sync::Mutex<HashMap<String, String>>,
     /// Digest-named image records freshdock created (see
     /// [`keep_current`](Self::keep_current)) and still has to remove once no
     /// listed container runs that image.
@@ -137,6 +143,7 @@ impl<R: CommandRunner> Nerdctl<R> {
             namespace,
             credentials,
             seen: std::sync::Mutex::new(HashMap::new()),
+            unidentified: std::sync::Mutex::new(HashMap::new()),
             kept,
             housekeeping: std::sync::atomic::AtomicBool::new(false),
         }
@@ -359,6 +366,10 @@ impl<R: CommandRunner> DockerCheck for Nerdctl<R> {
             .lock()
             .unwrap()
             .retain(|id, _| live.contains(id.as_str()));
+        self.unidentified
+            .lock()
+            .unwrap()
+            .retain(|id, _| live.contains(id.as_str()));
         self.release_kept_images().await;
         Ok(listed)
     }
@@ -457,27 +468,52 @@ impl<R: CommandRunner> Nerdctl<R> {
 
     /// The image `reference` points at now.
     async fn identify(&self, reference: &str) -> Seen {
+        self.try_identify(reference).await.unwrap_or_default()
+    }
+
+    /// [`identify`](Self::identify), or `None` when the lookup failed for a
+    /// reason that may pass (containerd restarting, a timeout). A tag that
+    /// doesn't exist locally is an answer, not a failure: nothing.
+    async fn try_identify(&self, reference: &str) -> Option<Seen> {
         let img = self.image_record(reference).await;
         // A digest reference already names one image. (nerdctl 2.3 can't
         // `image inspect` it, so that is not required.)
         if reference.contains('@') {
-            return Seen {
+            return Some(Seen {
                 id: img.ok().and_then(|i| i.id),
                 pinned: Some(reference.to_owned()),
-            };
+            });
         }
         let img = match img {
             Ok(img) => img,
+            Err(e) if e.is_not_found() => {
+                debug!(image = %reference, error = %e, "the image is not in containerd");
+                return Some(Seen::default());
+            }
             Err(e) => {
                 debug!(image = %reference, error = %e, "could not resolve the image");
-                return Seen::default();
+                return None;
             }
         };
         let pinned = crate::probe::local_manifest_digests(reference, &img.repo_digests)
             .into_iter()
             .next()
             .map(|digest| format!("{}@{digest}", crate::probe::strip_tag(reference)));
-        Seen { id: img.id, pinned }
+        Some(Seen { id: img.id, pinned })
+    }
+
+    /// The listed container, if any, whose image on `repository` (and `tag`,
+    /// when given) could not be looked up yet (see [`Nerdctl::unidentified`]).
+    fn unidentified_on(&self, repository: &str, tag: Option<&str>) -> Option<String> {
+        self.unidentified
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, reference)| {
+                let r = ImageRef::parse(reference);
+                r.repository == repository && tag.is_none_or(|t| r.tag == t)
+            })
+            .map(|(id, _)| id.get(..12).unwrap_or(id).to_owned())
     }
 
     /// Is there an image record named exactly `reference` (a digest
@@ -509,10 +545,11 @@ impl<R: CommandRunner> Nerdctl<R> {
     /// removed again once nothing needs it (see
     /// [`release_kept_images`](Self::release_kept_images)).
     ///
-    /// Only for a real sibling: when at least one container besides the one
-    /// being updated runs the image. The list of names to release lives in
-    /// memory, so a name made for a lone container would outlive a restart
-    /// before the next pass and hold the old image on disk for good.
+    /// Kept whenever a listed container runs the image, the one being updated
+    /// included: a pre-update hook can still call the update off after the
+    /// pull (exit 75, "not now"), and the next try creates its trial from the
+    /// image the container runs. The names are recorded on disk, so one a
+    /// restart orphans is released on the next pass all the same.
     async fn keep_current(&self, tag: &str) -> Option<String> {
         let pinned = self.identify(tag).await.pinned?;
         if pinned == tag {
@@ -525,8 +562,8 @@ impl<R: CommandRunner> Nerdctl<R> {
             .values()
             .filter(|s| s.pinned.as_deref().and_then(digest_of) == digest_of(&pinned))
             .count();
-        if runners < 2 {
-            debug!(image = %pinned, "no sibling runs the current image; nothing to keep");
+        if runners == 0 {
+            debug!(image = %pinned, "no listed container runs the current image; nothing to keep");
             return None;
         }
         match self.has_record(&pinned).await {
@@ -604,6 +641,14 @@ impl<R: CommandRunner> Nerdctl<R> {
         if !self.housekeeping.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
+        // Which images those containers run is unknown, so any kept name may
+        // be one of them.
+        if !self.unidentified.lock().unwrap().is_empty() {
+            debug!(
+                "an image of a listed container could not be looked up; releasing nothing this pass"
+            );
+            return;
+        }
         let needed: std::collections::HashSet<String> = self
             .seen
             .lock()
@@ -641,7 +686,16 @@ impl<R: CommandRunner> Nerdctl<R> {
         if let Some(seen) = self.seen.lock().unwrap().get(id) {
             return seen.clone();
         }
-        let seen = self.identify(reference).await;
+        // A lookup that failed is not remembered as "nothing": it is tried
+        // again on the next pass (see `unidentified`).
+        let Some(seen) = self.try_identify(reference).await else {
+            self.unidentified
+                .lock()
+                .unwrap()
+                .insert(id.to_owned(), reference.to_owned());
+            return Seen::default();
+        };
+        self.unidentified.lock().unwrap().remove(id);
         self.seen
             .lock()
             .unwrap()
@@ -958,6 +1012,14 @@ impl<R: CommandRunner> DockerOps for Nerdctl<R> {
 
     async fn pull(&self, image_ref: &ImageRef) -> Result<(), DockerError> {
         let reference = format!("{}:{}", image_ref.repository, image_ref.tag);
+        // A pull that moves the tag now would leave that container's image
+        // unidentifiable for good: the next lookup would see the new one.
+        if let Some(container) = self.unidentified_on(&image_ref.repository, Some(&image_ref.tag)) {
+            return Err(DockerError::Runtime(format!(
+                "not pulling {reference} yet: the image container {container} runs on that tag \
+                 could not be looked up, and moving the tag would hide it; trying again next pass"
+            )));
+        }
         let kept = self.keep_current(&reference).await;
         let (host, _) = split_repository(&image_ref.repository);
         let auth = match self.credentials.get(host) {
@@ -1097,6 +1159,13 @@ impl<R: CommandRunner> DockerOps for Nerdctl<R> {
         // doesn't count as a use of this digest-named record; removing it
         // would leave that sibling's own update nothing to try the flags on.
         if let Some(digest) = digest_of(id) {
+            let repository = ImageRef::parse(id.rsplit_once('@').map_or(id, |(r, _)| r)).repository;
+            if let Some(container) = self.unidentified_on(&repository, None) {
+                return Err(DockerError::Conflict(format!(
+                    "image {id} may still be run by container {container}, whose image could \
+                     not be looked up"
+                )));
+            }
             let runners: Vec<String> = self
                 .seen
                 .lock()
@@ -1740,15 +1809,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_lone_containers_pull_keeps_nothing() {
-        let n = nerdctl(pull_before_the_tag_moves());
+    async fn a_lone_container_can_retry_after_its_hook_called_the_update_off() {
+        let kept = format!("library/nginx@{OLD_DIGEST}");
+        let n = nerdctl(
+            FakeRunner::default()
+                .on_once(
+                    "image inspect library/nginx:alpine",
+                    ok(image_json("sha256:old", OLD_DIGEST)),
+                )
+                .on_once(
+                    "images --format {{.Name}}",
+                    ok("docker.io/library/nginx:alpine\n"),
+                )
+                // Once kept, containerd lists the old image under it.
+                .on(
+                    "images --format {{.Name}}",
+                    ok(format!("docker.io/library/nginx:alpine\n{kept}\n")),
+                )
+                .on(&format!("tag library/nginx:alpine {kept}"), ok(""))
+                .on("pull --quiet library/nginx:alpine", ok(""))
+                .on(
+                    "image inspect library/nginx:alpine",
+                    ok(image_json("sha256:new", NEW_DIGEST)),
+                )
+                .on(&format!("rmi {kept}"), ok("")),
+        );
+        n.housekeeping
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         // Only the container being updated runs the image.
         seen_running_old(&n, &[PLAIN_ID]);
         n.pull(&ImageRef::parse("nginx:alpine")).await.unwrap();
-        assert!(
-            !n.runner.calls().iter().any(|c| c.starts_with("tag ")),
-            "no record, so a restart can't leave one behind"
+        assert!(n.kept.names().contains(&kept), "kept before the tag moved");
+
+        // The pre-update hook says "not now", so the container keeps running
+        // the old image, and the next pass lists it again: nothing is released.
+        n.release_kept_images().await;
+        assert!(n.kept.names().contains(&kept));
+        // The retry's trial is created from the image the container runs.
+        let pinned = format!("docker.io/library/nginx@{OLD_DIGEST}");
+        assert_eq!(
+            n.local_image(&pinned, "library/nginx:alpine")
+                .await
+                .unwrap(),
+            pinned
         );
+
+        // Updated at last: the container now runs the new image, and the
+        // kept name goes.
+        n.seen.lock().unwrap().insert(
+            PLAIN_ID.to_owned(),
+            Seen {
+                id: Some("sha256:new".to_owned()),
+                pinned: Some(format!("docker.io/library/nginx@{NEW_DIGEST}")),
+            },
+        );
+        n.release_kept_images().await;
+        assert!(n.runner.calls().contains(&format!("rmi {kept}")));
+        assert!(n.kept.names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pull_no_listed_container_needs_keeps_nothing() {
+        let n = nerdctl(pull_before_the_tag_moves());
+        n.pull(&ImageRef::parse("nginx:alpine")).await.unwrap();
+        assert!(!n.runner.calls().iter().any(|c| c.starts_with("tag ")));
         assert!(n.kept.names().is_empty());
     }
 
@@ -1933,6 +2057,92 @@ mod tests {
             Some(format!("docker.io/library/nginx@{OLD_DIGEST}")),
             "cleanup and dependent repair act on the old image, not the new one"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_image_lookup_is_tried_again_and_holds_back_the_tag_until_then() {
+        let unreachable = "time=\"t\" level=fatal msg=\"failed to dial: connection refused\"\n";
+        let kept = format!("library/nginx@{NEW_DIGEST}");
+        let n = nerdctl(
+            FakeRunner::default()
+                .on("ps --no-trunc -q", ok(format!("{PLAIN_ID}\n")))
+                .on(
+                    &format!("inspect {PLAIN_ID}"),
+                    ok(fixture("nerdctl_plain_inspect.json")),
+                )
+                .on_once(&format!("image inspect {IMAGE}"), fail(unreachable))
+                .on(
+                    &format!("image inspect {IMAGE}"),
+                    ok(image_json("sha256:old", OLD_DIGEST)),
+                )
+                .on(&format!("rmi {kept}"), ok("")),
+        );
+        n.housekeeping
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        n.kept.insert(&kept);
+
+        let first = n.list_running().await.unwrap();
+        assert_eq!(first[0].image_id, None, "unknown this pass");
+        // Until it is known, nothing may hide the image it runs: no pull moves
+        // its tag, and no image of its repository goes.
+        let err = n.pull(&ImageRef::parse(IMAGE)).await.unwrap_err();
+        assert!(err.to_string().contains("could not be looked up"), "{err}");
+        let err = n
+            .remove_image(&format!("docker.io/library/nginx@{OLD_DIGEST}"), false)
+            .await
+            .unwrap_err();
+        assert!(err.is_conflict(), "{err}");
+        assert!(
+            !n.runner
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("pull ") || c.starts_with("tag ") || c.starts_with("rmi ")),
+            "{:?}",
+            n.runner.calls()
+        );
+        assert!(n.kept.names().contains(&kept), "not released while unknown");
+
+        // The next pass looks again, and remembers the answer.
+        let again = n.list_running().await.unwrap();
+        assert_eq!(again[0].image_id.as_deref(), Some("sha256:old"));
+        assert!(n.unidentified.lock().unwrap().is_empty());
+        assert!(n.runner.calls().contains(&format!("rmi {kept}")));
+        n.list_running().await.unwrap();
+        let lookups = n
+            .runner
+            .calls()
+            .iter()
+            .filter(|c| **c == format!("image inspect {IMAGE}"))
+            .count();
+        assert_eq!(lookups, 2, "looked up once more, then remembered");
+    }
+
+    #[tokio::test]
+    async fn an_image_missing_from_containerd_is_an_answer_not_a_failure() {
+        let n = nerdctl(
+            FakeRunner::default()
+                .on("ps --no-trunc -q", ok(format!("{PLAIN_ID}\n")))
+                .on(
+                    &format!("inspect {PLAIN_ID}"),
+                    ok(fixture("nerdctl_plain_inspect.json")),
+                )
+                .on(
+                    &format!("image inspect {IMAGE}"),
+                    fail(&format!(
+                        "time=\"t\" level=fatal msg=\"1 errors:\\nno such image: {IMAGE}\"\n"
+                    )),
+                ),
+        );
+        n.list_running().await.unwrap();
+        n.list_running().await.unwrap();
+        assert!(n.unidentified.lock().unwrap().is_empty());
+        let lookups = n
+            .runner
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("image inspect"))
+            .count();
+        assert_eq!(lookups, 1, "remembered: there is nothing to find");
     }
 
     #[tokio::test]
