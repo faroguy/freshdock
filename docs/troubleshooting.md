@@ -342,7 +342,25 @@ where the throwaway copy came out different.
 
 Common causes: a static `--ip`, an explicit `--group-add`, `--userns-remap`, an
 environment variable with a multi-line value or trailing whitespace, or a
-container created with different nerdctl global flags. Recreate the container by
+container created with different nerdctl global flags.
+
+The same refusal can name another container:
+
+```
+Error: not supported: vpn shares its network namespace with app, which would have to be re-created after the update but has settings freshdock can't reproduce with nerdctl, so vpn was not updated: environment variable CERT has a multi-line value
+```
+
+Updating `vpn` would leave `app` on a dead network namespace, and re-creating
+`app` to fix that would fail, so `vpn` is left alone too. Fix the setting on
+`app`, or opt `app` out with `freshdock.enable=false` (it then keeps a dead
+namespace after `vpn`'s update until you restart it).
+
+A refused update also happens when published ports can't be read: the
+container is not running when freshdock looks, and neither nerdctl's
+`network-config.json` nor the `nerdctl/ports` label of an older container
+lists them. It is tried again on the next pass.
+
+Recreate the container by
 hand without that setting, or keep it in `watch` mode so freshdock only reports
 updates. See [Deployment: with nerdctl](deployment.md#what-is-different-on-nerdctl).
 

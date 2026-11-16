@@ -249,14 +249,19 @@ logs both.
   container on a shared tag, `check` shows the others as up to date, although
   the daemon still knows they are behind and updates them on their own
   schedule. Trust the daemon's log over `check` for those.
+
+  If containerd can't be asked about a container's image (it is restarting,
+  say), freshdock asks again on the next pass, and until it has an answer it
+  pulls nothing on that tag and removes no image of that repository, so the
+  image the container runs can't move out of sight first.
 - **Containers are only ever created from local images** (`--pull=never`), so
   only `nerdctl pull` reaches the network, with freshdock's credentials and
-  proxy settings. When other containers run the same image as the one being
-  updated, freshdock first names that image by its digest
-  (`<repository>@sha256:...`), so the not-yet-updated siblings stay usable after
-  the pull moves the tag, and removes the name again once none of them runs it
-  (at once if the pull found nothing new). A lone container never gets such a
-  name. freshdock records the names it made in
+  proxy settings. Before a pull, freshdock names the image the tag points at by
+  its digest (`<repository>@sha256:...`) while any container runs it, so
+  containers still on it stay usable after the pull moves the tag: siblings not
+  updated yet, and a container whose pre-update hook calls its update off after
+  the pull. It removes the name again once no container runs that image (at
+  once if the pull found nothing new). freshdock records the names it made in
   `/var/lib/freshdock/nerdctl-kept-images` (root-only), so a restart, or a
   one-off `freshdock recreate`, doesn't lose track of them: the daemon removes
   them on a later pass. Names you made yourself are never touched.

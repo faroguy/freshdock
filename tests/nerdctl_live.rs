@@ -86,14 +86,20 @@ fn running(name: &str) -> bool {
     inspect(name).is_some_and(|c| c["State"]["Running"] == Value::Bool(true))
 }
 
-/// `portMappings` from the container's `network-config.json`.
+/// `portMappings` from the container's `network-config.json`. Panics when it
+/// can't be read, so two unreadable files never compare equal.
 fn port_mappings(name: &str) -> Value {
     let c = inspect(name).expect("container exists");
     let dir = c["Config"]["Labels"]["nerdctl/state-dir"]
         .as_str()
         .expect("state dir");
-    let body = std::fs::read_to_string(format!("{dir}/network-config.json")).unwrap_or_default();
-    serde_json::from_str::<Value>(&body).map_or(Value::Null, |v| v["portMappings"].clone())
+    let path = format!("{dir}/network-config.json");
+    let body = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let config: Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{path}: {e}"));
+    match &config["portMappings"] {
+        Value::Array(_) => config["portMappings"].clone(),
+        other => panic!("{path}: portMappings is {other}"),
+    }
 }
 
 fn now_unix() -> i64 {
@@ -109,10 +115,11 @@ fn prefix(test: &str) -> String {
     format!("fdl-{test}-{nanos}")
 }
 
-/// Stops and removes every container whose name starts with the prefix, and
-/// the listed networks. Stopping first matters: `rm -f` on a container with a
-/// restart policy can race containerd's restart monitor and orphan a task
-/// that keeps its ports.
+/// Stops and removes every container whose name starts with the prefix, then
+/// the listed networks and every volume whose name starts with the prefix
+/// (after the containers that mount them). Stopping first matters: `rm -f` on
+/// a container with a restart policy can race containerd's restart monitor
+/// and orphan a task that keeps its ports.
 struct Teardown {
     prefix: String,
     networks: Vec<String>,
@@ -129,6 +136,10 @@ impl Drop for Teardown {
         }
         for net in &self.networks {
             let _ = nerdctl(&["network", "rm", net]);
+        }
+        let volumes = nerdctl(&["volume", "ls", "--format", "{{.Name}}"]).unwrap_or_default();
+        for volume in volumes.lines().filter(|v| v.starts_with(&self.prefix)) {
+            let _ = nerdctl(&["volume", "rm", volume]);
         }
     }
 }
@@ -208,6 +219,10 @@ async fn a_richly_configured_container_round_trips() {
         "--health-interval", "2s",
         "--hostname", "rt-host", "--add-host", "example.test:10.0.0.9", "--dns", "9.9.9.9",
         "--cap-add", "NET_ADMIN", "--memory", "256m", "--cpus", "0.5", "--pids-limit", "300",
+        // Zero and -1 are settings here, not "unset" (#115 review).
+        "--memory-swappiness", "0", "--memory-swap", "-1",
+        // Recorded only in the OCI cgroups path.
+        "--cgroup-parent", "freshdock-live.slice",
         "--stop-signal", "SIGQUIT", "--stop-timeout", "20", "--log-opt", "max-size=5m",
         "--security-opt", "no-new-privileges", "--init", "--shm-size", "96m",
         NGINX,
@@ -216,6 +231,27 @@ async fn a_richly_configured_container_round_trips() {
     let before_id = id_of(&name).unwrap();
     let before = native(&name);
     let before_ports = port_mappings(&name);
+    let host_ports: Vec<_> = before_ports
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["HostPort"].as_u64())
+        .collect();
+    assert_eq!(
+        host_ports,
+        [Some(18190), Some(18191)],
+        "both published ports, before anything is compared: {before_ports}"
+    );
+    let cgroups_path = |c: &Value| {
+        c["Spec"]["linux"]["cgroupsPath"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    assert!(
+        cgroups_path(&before).is_some_and(|p| p.starts_with("freshdock-live.slice:")),
+        "{:?}",
+        cgroups_path(&before)
+    );
     let records_before = digest_records();
 
     let outcome = recreate(&n, &name).await.expect("recreate");
@@ -232,8 +268,22 @@ async fn a_richly_configured_container_round_trips() {
     let after_id = id_of(&name).expect("the container exists under its name");
     assert_ne!(after_id, before_id, "a new container replaced the old one");
     assert!(running(&name));
-    let differences = compare::differences(&before, &before_id, &native(&name), &after_id);
+    let after = native(&name);
+    let differences = compare::differences(&before, &before_id, &after, &after_id);
     assert!(differences.is_empty(), "settings changed: {differences:?}");
+    assert!(
+        cgroups_path(&after).is_some_and(|p| p.starts_with("freshdock-live.slice:")),
+        "still under its cgroup parent: {:?}",
+        cgroups_path(&after)
+    );
+    assert_eq!(
+        after["Spec"]["linux"]["resources"]["memory"]["swap"], -1,
+        "unlimited swap carried over"
+    );
+    assert_eq!(
+        after["Spec"]["linux"]["resources"]["memory"]["swappiness"], 0,
+        "zero swappiness carried over"
+    );
     assert_eq!(
         port_mappings(&name),
         before_ports,
@@ -434,6 +484,51 @@ async fn a_network_namespace_dependent_follows_its_owner() {
         "still on its tag, so it keeps being checked (#102)"
     );
     assert!(running(&dependent));
+}
+
+#[tokio::test]
+#[ignore = "needs rootful nerdctl; set FRESHDOCK_NERDCTL_LIVE=1"]
+async fn an_owner_whose_dependent_cannot_be_recreated_is_left_alone() {
+    // The dependent would have to be re-created after the owner's update,
+    // and an env file can't carry its multi-line value: refused up front,
+    // rather than stopping the dependent and failing to bring it back.
+    let Some(n) = backend().await else { return };
+    let p = prefix("nsref");
+    let _teardown = Teardown {
+        prefix: p.clone(),
+        networks: vec![],
+    };
+    let owner = format!("{p}-vpn");
+    let dependent = format!("{p}-app");
+    #[rustfmt::skip]
+    must(&[
+        "run", "-d", "--name", &owner, "--label", "freshdock.enable=true",
+        ALPINE, "sleep", "100000",
+    ]);
+    #[rustfmt::skip]
+    must(&[
+        "run", "-d", "--name", &dependent, "--network", &format!("container:{owner}"),
+        "-e", "CERT=line one\nline two", ALPINE, "sleep", "100000",
+    ]);
+    let owner_before = id_of(&owner).unwrap();
+    let dependent_before = id_of(&dependent).unwrap();
+
+    let err = recreate(&n, &owner)
+        .await
+        .expect_err("refused at preflight");
+    let msg = err.to_string();
+    assert!(msg.contains(&dependent), "{msg}");
+    assert!(msg.contains("CERT has a multi-line value"), "{msg}");
+    assert!(!msg.contains("line one"), "no value is printed: {msg}");
+    assert_eq!(id_of(&owner).as_deref(), Some(owner_before.as_str()));
+    assert_eq!(
+        id_of(&dependent).as_deref(),
+        Some(dependent_before.as_str())
+    );
+    assert!(
+        running(&owner) && running(&dependent),
+        "nothing was stopped"
+    );
 }
 
 #[tokio::test]
