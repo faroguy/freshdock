@@ -208,10 +208,22 @@ logs both.
   runtime settings with the original's, and removes it. If they differ, the update
   is refused and the log names the differing fields. The container keeps running
   untouched.
+- **The new image's own settings apply.** nerdctl reports a container's settings
+  with its image's merged in: `ENV`, `LABEL`, `ENTRYPOINT`, `CMD`, `WORKDIR`,
+  `USER`, `STOPSIGNAL` and `HEALTHCHECK`. freshdock reads the config of the image
+  the container runs (with `ctr content get`) and leaves out every value that is
+  that image's own, so the updated container gets the new image's values, and
+  a variable or label only the old image set goes with it. What you set yourself
+  (`-e`, `--label`, a compose `command:`, an `--entrypoint`) is kept, even where it
+  overrides the image. A value you set equal to the image's own counts as the
+  image's, and follows the new image. If the image's config can't be read, the
+  update is refused and tried again on the next pass.
 - **Some settings are always refused**: a static IP (`--ip`), an explicit
   `--group-add` (nerdctl reports it together with the groups it derives from the
-  image), `--userns-remap`, an environment variable whose value spans several
-  lines or ends in whitespace, and anything nerdctl does not report. A container
+  image), `--userns-remap`, an environment variable of the container's own whose
+  value spans several lines or ends in whitespace, an exec-form healthcheck of
+  the container's own (`CMD`, not `CMD-SHELL`), and anything nerdctl does not
+  report. A container
   created with different nerdctl global flags (for example another
   `--snapshotter`) is refused too. Recreate such a container by hand, or keep it in
   `watch` mode.

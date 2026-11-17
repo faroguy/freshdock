@@ -360,6 +360,24 @@ container is not running when freshdock looks, and neither nerdctl's
 `network-config.json` nor the `nerdctl/ports` label of an older container
 lists them. It is tried again on the next pass.
 
+```
+Error: not supported: freshdock could not read the config of the image web runs, so it can't tell the image's own settings from the container's ...
+```
+
+freshdock leaves the image's own settings (its `ENV`, labels, command and so
+on) to the new image, which needs the old image's config, read with `ctr`. It
+can't be read when `ctr` doesn't work (see
+[above](#nerdctl-could-not-reach-containerd)), or when containerd was too busy
+to answer; the update is tried again on the next pass.
+
+A container an earlier freshdock updated may still carry the old image's
+values from before this was fixed (an old version number in its environment,
+say). They now count as the container's own and stay. Re-create the container
+once by hand to clear them: `nerdctl stop` and `nerdctl rm` it, then
+`nerdctl compose up -d` (or `nerdctl run` it again). Stop and remove it first:
+containerd restarts a container compose replaces, and `up` then fails on a
+name or port conflict.
+
 Recreate the container by
 hand without that setting, or keep it in `watch` mode so freshdock only reports
 updates. See [Deployment: with nerdctl](deployment.md#what-is-different-on-nerdctl).

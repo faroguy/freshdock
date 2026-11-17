@@ -11,6 +11,11 @@
 //!   ports, which inspect only reports while the container is running (the
 //!   `nerdctl/ports` label holds them for containers nerdctl 1.x made).
 //!
+//! Inspect shows the image's own settings (`ENV`, `LABEL`, `ENTRYPOINT`,
+//! `CMD`, `WORKDIR`, `USER`, `STOPSIGNAL`, `HEALTHCHECK`) merged into the
+//! container's. Those are left out, compared against the image's config
+//! ([`ImageConfig`]), so an updated container gets its new image's values.
+//!
 //! A setting freshdock cannot reproduce is recorded in
 //! [`NerdctlSpec::unsupported`] instead of being dropped, and the update is
 //! refused before the container is stopped.
@@ -82,16 +87,76 @@ pub struct NerdctlSpec {
     /// are world-readable in `/proc`, and values are often secrets. They go
     /// through an owner-only `--env-file` (see [`env_file`](Self::env_file)).
     pub env: Vec<String>,
-    /// `--entrypoint` value: the container's `Path`.
+    /// `--entrypoint` value: the container's `Path`, unless the image's own
+    /// entrypoint is left to the image.
     pub entrypoint: Option<String>,
-    /// Arguments after the image: the container's `Args`.
+    /// Arguments after the image: the container's `Args`, less what is left
+    /// to the image.
     pub args: Vec<String>,
     /// Settings freshdock can't reproduce; a non-empty list refuses the update.
     pub unsupported: Vec<String>,
-    /// Variables refused because the env file can't carry them, each with
-    /// its entry in `unsupported` (see [`leave_image_env`](Self::leave_image_env)).
-    /// Never printed: the value may be a secret.
-    pub(crate) env_refusals: Vec<(String, String)>,
+    /// Built without the image's config (see [`ImageConfig`]), so every
+    /// setting the image gave the container is carried over as if the
+    /// container had set it. Right for a re-create from the same image; an
+    /// update would pin the old image's values over the new one's, so
+    /// preflight refuses it.
+    pub image_config_unknown: bool,
+}
+
+/// What an image gives every container made from it: the `config` section
+/// of its config blob. Inspect reports a container's settings with these
+/// already merged in, so a rebuild leaves out each value that is the image's
+/// own; the image it is re-created from then supplies its own value instead.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImageConfig {
+    pub env: Option<Vec<String>>,
+    pub labels: Option<HashMap<String, String>>,
+    pub user: Option<String>,
+    pub working_dir: Option<String>,
+    pub stop_signal: Option<String>,
+    pub entrypoint: Option<Vec<String>>,
+    pub cmd: Option<Vec<String>>,
+    healthcheck: Option<Healthcheck>,
+}
+
+impl ImageConfig {
+    /// From a config blob (`ctr content get <config digest>`); `None` when it
+    /// is not one. A blob without a `config` section is an image that sets
+    /// nothing.
+    pub fn from_blob(blob: &str) -> Option<Self> {
+        let parsed: Value = serde_json::from_str(blob).ok()?;
+        if !parsed.is_object() {
+            return None;
+        }
+        match parsed.get("config") {
+            None | Some(Value::Null) => Some(Self::default()),
+            Some(config) => serde_json::from_value(config.clone()).ok(),
+        }
+    }
+}
+
+/// What nerdctl uses for a healthcheck timing the image leaves unset, and
+/// records as if it had been given (seen for `Retries` with nerdctl 2.3.4).
+const HEALTHCHECK_DEFAULTS: (i64, i64, i64, i64) = (30_000_000_000, 30_000_000_000, 0, 3);
+
+/// Is the container's healthcheck the image's own? An unset image timing
+/// matches the container's unset, or at nerdctl's default.
+fn is_image_healthcheck(container: &Healthcheck, image: Option<&Healthcheck>) -> bool {
+    let Some(image) = image else {
+        return false;
+    };
+    let set = |v: Option<i64>| v.filter(|n| *n > 0);
+    let same = |c: Option<i64>, i: Option<i64>, default: i64| match set(i) {
+        Some(i) => set(c) == Some(i),
+        None => set(c).is_none() || set(c) == Some(default),
+    };
+    let (interval, timeout, start_period, retries) = HEALTHCHECK_DEFAULTS;
+    container.test == image.test
+        && same(container.interval, image.interval, interval)
+        && same(container.timeout, image.timeout, timeout)
+        && same(container.start_period, image.start_period, start_period)
+        && same(container.retries, image.retries, retries)
 }
 
 /// The parts of the Docker-compatible inspect a rebuild needs.
@@ -263,8 +328,9 @@ pub struct PortMapping {
     pub host_ip: Option<String>,
 }
 
-/// `nerdctl/healthcheck`: Docker's healthcheck shape, durations in ns.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// `nerdctl/healthcheck`, and an image config's `Healthcheck`: Docker's
+/// healthcheck shape, durations in ns.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct Healthcheck {
     test: Option<Vec<String>>,
@@ -278,10 +344,16 @@ impl NerdctlSpec {
     /// Build a spec from the three sources. `network_config` is `None` when
     /// the state directory's file could not be read; the ports then come from
     /// inspect, which only has them while the container runs.
+    ///
+    /// `image` is the config of the image the container runs. What it sets
+    /// itself is left out, so that the image a container is re-created from
+    /// gives its own values. Without it, `image_config_unknown` is set and
+    /// everything is carried over.
     pub fn from_inspect(
         compat: CreateInspect,
         native: NativeInspect,
         network_config: Option<NetworkConfig>,
+        image: Option<&ImageConfig>,
     ) -> Self {
         let mut spec = NerdctlSpec::default();
         let config = compat.config.clone().unwrap_or_default();
@@ -308,6 +380,10 @@ impl NerdctlSpec {
             spec.flags.push("--init".to_owned());
             spec.entrypoint = Some(spec.args[1].clone());
             spec.args.drain(..2);
+        }
+        spec.image_config_unknown = image.is_none();
+        if let Some(image) = image {
+            spec.leave_command_to(image);
         }
         spec.hostname = spec
             .labels
@@ -345,15 +421,22 @@ impl NerdctlSpec {
         if process.terminal == Some(true) {
             spec.flags.push("--tty".to_owned());
         }
-        if let Some(cwd) = process.cwd.filter(|c| !c.is_empty()) {
+        // Unset in the image, the working directory is `/`.
+        let image_workdir = image.map(|i| non_empty(i.working_dir.as_deref()).unwrap_or("/"));
+        if let Some(cwd) = process.cwd.filter(|c| !c.is_empty())
+            && image_workdir != Some(cwd.as_str())
+        {
             push(&mut spec.flags, "--workdir", cwd);
         }
-        if let Some(user) = config.user.filter(|u| !u.is_empty()) {
+        if let Some(user) = config.user.filter(|u| !u.is_empty())
+            && image.and_then(|i| non_empty(i.user.as_deref())) != Some(user.as_str())
+        {
             push(&mut spec.flags, "--user", user);
         }
+        let image_env = image.and_then(|i| i.env.as_deref()).unwrap_or_default();
         for var in config.env.unwrap_or_default() {
             // nerdctl sets HOSTNAME itself, from the hostname.
-            if var.starts_with("HOSTNAME=") {
+            if var.starts_with("HOSTNAME=") || image_env.contains(&var) {
                 continue;
             }
             // The env file (see `env`) holds one variable per line and nerdctl
@@ -368,18 +451,17 @@ impl NerdctlSpec {
                 None
             };
             match refusal {
-                Some(why) => {
-                    spec.unsupported.push(why.clone());
-                    spec.env_refusals.push((var, why));
-                }
+                Some(why) => spec.unsupported.push(why),
                 None => spec.env.push(var),
             }
         }
+        let image_labels = image.and_then(|i| i.labels.as_ref());
         let user_labels: Vec<(String, String)> = {
             let mut l: Vec<_> = spec
                 .labels
                 .iter()
                 .filter(|(k, _)| !RUNTIME_LABEL_PREFIXES.iter().any(|p| k.starts_with(p)))
+                .filter(|(k, v)| image_labels.and_then(|l| l.get(*k)) != Some(v))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             l.sort();
@@ -388,7 +470,12 @@ impl NerdctlSpec {
         for (k, v) in user_labels {
             push(&mut spec.flags, "--label", format!("{k}={v}"));
         }
-        if let Some(signal) = spec.labels.get(STOP_SIGNAL_LABEL).filter(|s| !s.is_empty()) {
+        // nerdctl records the signal for every container: unset in the
+        // image, it is SIGTERM.
+        let image_signal = image.map(|i| non_empty(i.stop_signal.as_deref()).unwrap_or("SIGTERM"));
+        if let Some(signal) = spec.labels.get(STOP_SIGNAL_LABEL).filter(|s| !s.is_empty())
+            && image_signal != Some(signal.as_str())
+        {
             push(&mut spec.flags, "--stop-signal", signal.clone());
         }
         if let Some(timeout) = spec
@@ -405,7 +492,7 @@ impl NerdctlSpec {
         {
             push(&mut spec.flags, "--platform", platform.clone());
         }
-        spec.healthcheck();
+        spec.healthcheck(image);
         spec.mounts();
         spec.host_config(compat.host_config.clone().unwrap_or_default());
         spec.check_labels();
@@ -475,29 +562,38 @@ impl NerdctlSpec {
         args
     }
 
-    /// Leave to the image what it sets itself. A refused variable whose
-    /// exact `NAME=value` is in the environment of the image the container
-    /// runs (`image_env`, from the image config) needs no carrying over: a
-    /// container created from that image gets it anyway, and an updated one
-    /// gets its new image's. Prompts like LinuxServer's `PS1` end in a space.
-    /// A variable the container set itself, or set to another value, stays
-    /// refused.
-    pub fn leave_image_env(&mut self, image_env: &[String]) {
-        let (from_image, own): (Vec<_>, Vec<_>) = std::mem::take(&mut self.env_refusals)
-            .into_iter()
-            .partition(|(var, _)| image_env.contains(var));
-        for (_, why) in &from_image {
-            if let Some(i) = self.unsupported.iter().position(|u| u == why) {
-                self.unsupported.remove(i);
-            }
+    /// Leave the image's `ENTRYPOINT` and `CMD` to the image. Inspect gives
+    /// the whole command line, the entrypoint followed by the command, so
+    /// that is what is compared:
+    ///
+    /// - all of it is the image's: neither is passed;
+    /// - it starts with the image's entrypoint: only the rest is passed, as
+    ///   the command;
+    /// - otherwise both stay. `--entrypoint` also clears the image's `CMD`,
+    ///   so an entrypoint of the container's own can't be passed without
+    ///   the command it runs, even one that equals the image's.
+    fn leave_command_to(&mut self, image: &ImageConfig) {
+        let command: Vec<String> = self
+            .entrypoint
+            .iter()
+            .chain(self.args.iter())
+            .cloned()
+            .collect();
+        let entrypoint = image.entrypoint.as_deref().unwrap_or_default();
+        let cmd = image.cmd.as_deref().unwrap_or_default();
+        if command.len() == entrypoint.len() + cmd.len()
+            && command.starts_with(entrypoint)
+            && command.ends_with(cmd)
+        {
+            self.entrypoint = None;
+            self.args.clear();
+        } else if !entrypoint.is_empty()
+            && command.len() > entrypoint.len()
+            && command.starts_with(entrypoint)
+        {
+            self.entrypoint = None;
+            self.args = command[entrypoint.len()..].to_vec();
         }
-        self.env_refusals = own;
-    }
-
-    /// Whether any variable was refused that [`leave_image_env`](Self::leave_image_env)
-    /// might yet leave to the image.
-    pub fn has_env_refusals(&self) -> bool {
-        !self.env_refusals.is_empty()
     }
 
     pub fn stop_signal(&self) -> Option<&str> {
@@ -580,7 +676,7 @@ impl NerdctlSpec {
             .cloned();
     }
 
-    fn healthcheck(&mut self) {
+    fn healthcheck(&mut self, image: Option<&ImageConfig>) {
         let Some(raw) = self.labels.get("nerdctl/healthcheck").cloned() else {
             return;
         };
@@ -589,6 +685,10 @@ impl NerdctlSpec {
                 .push("a healthcheck nerdctl recorded in an unknown format".to_owned());
             return;
         };
+        // The image's own, in whatever form: its new image brings its own.
+        if is_image_healthcheck(&check, image.and_then(|i| i.healthcheck.as_ref())) {
+            return;
+        }
         let test = check.test.unwrap_or_default();
         match test.first().map(String::as_str) {
             None => return,
@@ -1032,6 +1132,10 @@ fn publish_ip(ip: &str) -> String {
     }
 }
 
+fn non_empty(s: Option<&str>) -> Option<&str> {
+    s.filter(|s| !s.is_empty())
+}
+
 fn push(args: &mut Vec<String>, flag: &str, value: impl Into<String>) {
     args.push(flag.to_owned());
     args.push(value.into());
@@ -1089,6 +1193,7 @@ mod tests {
             compat.into_iter().next().unwrap(),
             native.into_iter().next().unwrap(),
             network_config,
+            None,
         )
     }
 
@@ -1271,6 +1376,7 @@ mod tests {
             },
             NativeInspect::default(),
             None,
+            None,
         );
         assert_eq!(spec.flags, ["--volume", "/srv:/srv:rprivate,ro"]);
     }
@@ -1295,6 +1401,7 @@ mod tests {
                 ..Default::default()
             },
             NativeInspect::default(),
+            None,
             None,
         )
     }
@@ -1327,25 +1434,261 @@ mod tests {
         );
     }
 
+    /// The fixture image's config, as `nerdctl image inspect` shows it.
+    fn nginx_config() -> ImageConfig {
+        let image: Vec<Value> =
+            serde_json::from_str(&fixture("nerdctl_image_inspect.json")).unwrap();
+        serde_json::from_value(image[0]["Config"].clone()).unwrap()
+    }
+
+    /// A container built from JSON, against an image config built from JSON.
+    fn against(compat: Value, native: Value, image: Value) -> NerdctlSpec {
+        let image: ImageConfig = serde_json::from_value(image).unwrap();
+        NerdctlSpec::from_inspect(
+            serde_json::from_value(compat).unwrap(),
+            serde_json::from_value(native).unwrap(),
+            None,
+            Some(&image),
+        )
+    }
+
     #[test]
-    fn what_the_image_sets_itself_is_left_to_the_image() {
-        let mut spec = with_env(&["PS1=$ ", "MOTD=hi\nthere", "A=1"]);
-        assert_eq!(spec.unsupported.len(), 2);
-        spec.leave_image_env(&["PATH=/bin".into(), "PS1=$ ".into()]);
+    fn the_images_own_settings_are_left_to_the_image() {
+        // fd-full runs nginx's own entrypoint, command, environment and
+        // labels, with settings of its own on top.
+        let compat: Vec<CreateInspect> =
+            serde_json::from_str(&fixture("nerdctl_full_inspect.json")).unwrap();
+        let native: Vec<NativeInspect> =
+            serde_json::from_str(&fixture("nerdctl_full_native.json")).unwrap();
+        let network_config =
+            serde_json::from_str(&fixture("nerdctl_full_network_config.json")).unwrap();
+        let mut image = nginx_config();
+        image.stop_signal = Some("SIGQUIT".to_owned());
+        let spec = NerdctlSpec::from_inspect(
+            compat.into_iter().next().unwrap(),
+            native.into_iter().next().unwrap(),
+            Some(network_config),
+            Some(&image),
+        );
+        assert!(spec.unsupported.is_empty(), "{:?}", spec.unsupported);
+        assert!(!spec.image_config_unknown);
+        let args = spec.create_args("fd-full", "nginx:1.28-alpine", None);
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("nginx:1.28-alpine"),
+            "the new image's own entrypoint and command: {args:?}"
+        );
+        assert!(!args.contains(&"--entrypoint".to_owned()), "{args:?}");
+        assert_eq!(spec.env, ["FOO=bar", "EMPTY="], "only its own variables");
+        let got = pairs(&args);
+        assert!(!got.iter().any(|a| a.contains("maintainer=")), "{got:?}");
+        assert!(
+            !got.iter().any(|a| a.starts_with("--stop-signal")),
+            "{got:?}"
+        );
+        for own in [
+            "--label freshdock.enable=true",
+            "--workdir /tmp",
+            "--user 101:101",
+            "--health-cmd wget -qO- http://localhost/ || exit 1",
+        ] {
+            assert!(got.contains(&own.to_owned()), "missing {own:?} in {got:?}");
+        }
+        // Without the image's config everything is carried over, and that
+        // is recorded.
+        let unknown = spec_from("full", true);
+        assert!(unknown.image_config_unknown);
+        assert!(unknown.env.contains(&"NGINX_VERSION=1.27.5".to_owned()));
+    }
+
+    #[test]
+    fn a_command_is_compared_with_the_images_as_a_whole() {
+        let command = |path: &str, args: &[&str], image: Value| {
+            let spec = against(
+                serde_json::json!({"Path": path, "Args": args}),
+                serde_json::json!({}),
+                image,
+            );
+            (spec.entrypoint, spec.args)
+        };
+        let nginx = serde_json::json!({
+            "Entrypoint": ["/docker-entrypoint.sh"], "Cmd": ["nginx", "-g", "daemon off;"]
+        });
+        let none = (None, Vec::<String>::new());
+        // All the image's.
+        assert_eq!(
+            command(
+                "/docker-entrypoint.sh",
+                &["nginx", "-g", "daemon off;"],
+                nginx.clone()
+            ),
+            none
+        );
+        // The image's entrypoint, a command of the container's own: as
+        // compose's `command:` does.
+        assert_eq!(
+            command(
+                "/usr/bin/env",
+                &["--", "sleep", "1"],
+                serde_json::json!({"Entrypoint": ["/usr/bin/env", "--"]})
+            ),
+            (None, vec!["sleep".to_owned(), "1".to_owned()])
+        );
+        // An entrypoint of its own keeps its command, even the image's:
+        // `--entrypoint` alone would drop the image's CMD.
+        assert_eq!(
+            command("/bin/sh", &["nginx", "-g", "daemon off;"], nginx.clone()),
+            (
+                Some("/bin/sh".to_owned()),
+                vec!["nginx".into(), "-g".into(), "daemon off;".into()]
+            )
+        );
+        // The image's entrypoint with no command: that is `--entrypoint`
+        // clearing the image's CMD, which only the flag can say again.
+        assert_eq!(
+            command("/docker-entrypoint.sh", &[], nginx.clone()),
+            (Some("/docker-entrypoint.sh".to_owned()), vec![])
+        );
+        // An image with only a CMD, and another command: as before.
+        assert_eq!(
+            command("sleep", &["1"], serde_json::json!({"Cmd": ["sh"]})),
+            (Some("sleep".to_owned()), vec!["1".to_owned()])
+        );
+        assert_eq!(command("sh", &[], serde_json::json!({"Cmd": ["sh"]})), none);
+        // `--init`: what tini runs is what is compared.
+        let spec = against(
+            serde_json::json!({
+                "Path": INIT_PATH,
+                "Args": ["--", "/docker-entrypoint.sh", "nginx", "-g", "daemon off;"]
+            }),
+            serde_json::json!({"Spec": {"mounts": [{"destination": INIT_PATH}]}}),
+            nginx,
+        );
+        assert_eq!((spec.entrypoint, spec.args), none);
+        assert_eq!(spec.flags, ["--init"]);
+    }
+
+    #[test]
+    fn workdir_user_and_stop_signal_the_image_sets_are_left_out() {
+        let flags = |workdir: &str, user: &str, signal: &str, image: Value| {
+            let spec = against(
+                serde_json::json!({"Config": {
+                    "User": user,
+                    "Labels": {"io.containerd.image.config.stop-signal": signal}
+                }}),
+                serde_json::json!({"Spec": {"process": {
+                    "cwd": workdir, "apparmorProfile": DEFAULT_APPARMOR_PROFILE
+                }}}),
+                image,
+            );
+            spec.flags
+        };
+        let image = serde_json::json!({
+            "WorkingDir": "/srv", "User": "4321", "StopSignal": "SIGUSR1"
+        });
+        assert!(flags("/srv", "4321", "SIGUSR1", image.clone()).is_empty());
+        assert_eq!(
+            flags("/data", "0", "SIGINT", image),
+            [
+                "--workdir",
+                "/data",
+                "--user",
+                "0",
+                "--stop-signal",
+                "SIGINT"
+            ]
+        );
+        // Unset in the image: `/`, no user, and SIGTERM, which nerdctl
+        // records for every container.
+        assert!(flags("/", "", "SIGTERM", serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn variables_and_labels_the_image_sets_are_left_out() {
+        let spec = against(
+            serde_json::json!({"Config": {
+                "Env": ["LD_PRELOAD=/usr/lib/libmimalloc.so.2", "PS1=$ ", "MOTD=hi\nthere",
+                        "SHARED=mine", "A=1"],
+                "Labels": {"org.opencontainers.image.version": "v1", "app": "mine",
+                           "shared": "mine"}
+            }}),
+            serde_json::json!({}),
+            serde_json::json!({
+                "Env": ["LD_PRELOAD=/usr/lib/libmimalloc.so.2", "PS1=$ ", "SHARED=image"],
+                "Labels": {"org.opencontainers.image.version": "v1", "shared": "image"}
+            }),
+        );
+        assert_eq!(spec.env, ["SHARED=mine", "A=1"]);
         assert_eq!(
             spec.unsupported,
             ["environment variable MOTD has a multi-line value"],
-            "only the image's own value is exempt"
+            "the image's own PS1 ends in a space, but is the image's to set"
         );
-        assert_eq!(spec.env, ["A=1"], "and nothing extra is passed for it");
-        assert!(spec.has_env_refusals());
-        // The same name with another value is the container's own setting.
-        let mut spec = with_env(&["PS1=# "]);
-        spec.leave_image_env(&["PS1=$ ".into()]);
         assert_eq!(
-            spec.unsupported,
-            ["environment variable PS1 ends in whitespace"]
+            pairs(&spec.flags),
+            ["--label app=mine", "--label shared=mine"]
         );
+    }
+
+    #[test]
+    fn an_images_healthcheck_is_left_to_the_image() {
+        let check = |label: Value, image: Value| {
+            let spec = against(
+                serde_json::json!({"Config": {"Labels": {
+                    "nerdctl/healthcheck": label.to_string()
+                }}}),
+                serde_json::json!({}),
+                image,
+            );
+            (spec.flags, spec.unsupported)
+        };
+        // As nerdctl 2.3.4 records the image's `HEALTHCHECK --interval=7s
+        // --timeout=3s CMD test -d /srv`, retries filled in.
+        let image = serde_json::json!({"Healthcheck": {
+            "Test": ["CMD-SHELL", "test -d /srv"], "Interval": 7_000_000_000_i64,
+            "Timeout": 3_000_000_000_i64
+        }});
+        let recorded = serde_json::json!({
+            "Test": ["CMD-SHELL", "test -d /srv"], "Interval": 7_000_000_000_i64,
+            "Timeout": 3_000_000_000_i64, "Retries": 3
+        });
+        assert_eq!(check(recorded.clone(), image.clone()), (vec![], vec![]));
+        // Its own timing: all of it is passed.
+        let mut own = recorded.clone();
+        own["Retries"] = Value::from(5);
+        let (flags, unsupported) = check(own, image.clone());
+        assert!(unsupported.is_empty());
+        assert!(
+            pairs(&flags).contains(&"--health-retries 5".to_owned()),
+            "{flags:?}"
+        );
+        assert!(pairs(&flags).contains(&"--health-cmd test -d /srv".to_owned()));
+        // The image has none: the container's own.
+        let (flags, _) = check(recorded, serde_json::json!({}));
+        assert!(!flags.is_empty());
+        // An image's exec form, which a flag can't give, needn't be.
+        let exec = serde_json::json!({"Test": ["CMD", "curl", "-f", "http://localhost"]});
+        assert_eq!(
+            check(exec.clone(), serde_json::json!({"Healthcheck": exec})),
+            (vec![], vec![])
+        );
+    }
+
+    #[test]
+    fn an_image_config_is_read_from_its_blob() {
+        let blob = r#"{"architecture":"amd64","config":{"Env":["A=1"],"Cmd":["sh"],
+            "Entrypoint":null,"User":"4321"}}"#;
+        let config = ImageConfig::from_blob(blob).unwrap();
+        assert_eq!(config.env.as_deref(), Some(&["A=1".to_owned()][..]));
+        assert_eq!(config.entrypoint, None);
+        assert_eq!(config.user.as_deref(), Some("4321"));
+        assert_eq!(
+            ImageConfig::from_blob(r#"{"architecture":"amd64"}"#),
+            Some(ImageConfig::default()),
+            "an image that sets nothing"
+        );
+        assert_eq!(ImageConfig::from_blob("not json"), None);
+        assert_eq!(ImageConfig::from_blob("[]"), None);
     }
 
     #[test]
@@ -1463,7 +1806,7 @@ mod tests {
             "nerdctl/mounts.0".to_owned(),
             r#"{"Type":"npipe","Destination":"/x"}"#.to_owned(),
         );
-        let spec = NerdctlSpec::from_inspect(c, NativeInspect::default(), None);
+        let spec = NerdctlSpec::from_inspect(c, NativeInspect::default(), None, None);
         assert_eq!(
             spec.unsupported,
             [
@@ -1490,6 +1833,7 @@ mod tests {
                 },
                 NativeInspect::default(),
                 None,
+                None,
             )
         };
         let exec = with_health(r#"{"Test":["CMD","curl","-f","http://localhost"]}"#);
@@ -1506,6 +1850,7 @@ mod tests {
                 ..Default::default()
             },
             NativeInspect::default(),
+            None,
             None,
         )
     }
@@ -1570,6 +1915,7 @@ mod tests {
                     ..Default::default()
                 },
                 native,
+                None,
                 None,
             )
         };

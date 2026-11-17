@@ -40,7 +40,7 @@ use self::inspect::{
 use self::kept::{DEFAULT_STATE_FILE, KeptStore};
 use self::private::{PrivateDir, remove_stale_dirs, split_marked, unique_suffix};
 use self::runner::{CmdOutput, CommandRunner, ProcessRunner, RunError, proxy_env};
-use self::spec::{CreateInspect, NativeInspect, NerdctlSpec, NetworkConfig};
+use self::spec::{CreateInspect, ImageConfig, NativeInspect, NerdctlSpec, NetworkConfig};
 
 /// The oldest nerdctl freshdock is tested against.
 const MIN_NERDCTL: (u32, u32) = (2, 3);
@@ -269,25 +269,22 @@ impl<R: CommandRunner> Nerdctl<R> {
             .any(|(h, p)| *h == host && *p == path))
     }
 
-    /// The environment the image with config digest `config` sets, read from
-    /// its config blob with `ctr` (nerdctl can't inspect an image by id, and
-    /// once a tag moves the image may have no name left). `None` when it
+    /// What the image with config digest `config` gives its containers, read
+    /// from its config blob with `ctr` (nerdctl can't inspect an image by id,
+    /// and once a tag moves the image may have no name left). `None` when it
     /// can't be read: nothing is then left to the image.
-    async fn image_env(&self, config: Option<&str>) -> Option<Vec<String>> {
+    async fn image_config(&self, config: Option<&str>) -> Option<ImageConfig> {
         let config = config.filter(|c| c.starts_with("sha256:"))?;
         let blob = self
             .ctr_call(&["content", "get", config])
             .await
             .inspect_err(|e| debug!(image = %config, error = %e, "could not read the image config"))
             .ok()?;
-        let parsed: serde_json::Value = serde_json::from_str(&blob).ok()?;
-        Some(
-            parsed["config"]["Env"]
-                .as_array()?
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect(),
-        )
+        let parsed = ImageConfig::from_blob(&blob);
+        if parsed.is_none() {
+            debug!(image = %config, "the image config is in an unknown format");
+        }
+        parsed
     }
 
     /// `nerdctl image inspect`, as reported: every `RepoDigests` entry kept.
@@ -973,12 +970,10 @@ impl<R: CommandRunner> DockerOps for Nerdctl<R> {
             None => self.identify(&image_ref).await,
         };
         let network_config = self.network_config(&compat).await;
-        let mut spec = NerdctlSpec::from_inspect(compat, native, network_config);
-        if spec.has_env_refusals()
-            && let Some(env) = self.image_env(seen.id.as_deref()).await
-        {
-            spec.leave_image_env(&env);
-        }
+        // What the image the container runs gives it, so the rebuild leaves
+        // that to the image it is created from.
+        let image = self.image_config(seen.id.as_deref()).await;
+        let spec = NerdctlSpec::from_inspect(compat, native, network_config, image.as_ref());
         Ok(ContainerSpec {
             name: container_name,
             image_ref,
@@ -1000,6 +995,18 @@ impl<R: CommandRunner> DockerOps for Nerdctl<R> {
     async fn preflight_recreate(&self, spec: &ContainerSpec) -> Result<(), DockerError> {
         let nerdctl = spec.nerdctl()?;
         refuse_unsupported(&spec.name, nerdctl)?;
+        // A dependent's repair re-creates it from the image it runs, which
+        // then gives the same values anyway; only an update needs them told
+        // apart.
+        if nerdctl.image_config_unknown {
+            return Err(DockerError::Unsupported(format!(
+                "freshdock could not read the config of the image {} runs, so it can't tell \
+                 the image's own settings from the container's, and carrying them all over \
+                 would keep the old image's values over the new one's; it was not updated. \
+                 It is tried again on the next pass",
+                spec.name
+            )));
+        }
         self.refuse_unreproducible_dependents(&spec.name).await?;
         let trial = format!("{}{CHECK_MARKER}{}", spec.name, unique_suffix());
         let without_ports = NerdctlSpec {
@@ -1554,8 +1561,25 @@ mod tests {
         }
     }
 
+    /// A backend whose `ctr` reads one thing: an image config, every one the
+    /// fixture image's (see [`fixture_image_config`]). Anything else fails
+    /// as it does with no `ctr` at all. Tests of `ctr` itself set their own.
     fn nerdctl(runner: FakeRunner) -> Nerdctl<FakeRunner> {
-        Nerdctl::with_runner(runner, NS.to_owned(), Arc::new(CredentialStore::default()))
+        let mut n =
+            Nerdctl::with_runner(runner, NS.to_owned(), Arc::new(CredentialStore::default()));
+        n.ctr = Some(
+            FakeRunner::default()
+                .on("content get sha256:*", ok(fixture_image_config()))
+                .on("*", fail("ctr is not available")),
+        );
+        n
+    }
+
+    /// The fixture image's config blob, as `ctr content get` prints it.
+    fn fixture_image_config() -> String {
+        let image: Vec<serde_json::Value> =
+            serde_json::from_str(&fixture("nerdctl_image_inspect.json")).unwrap();
+        serde_json::json!({"architecture": "amd64", "config": image[0]["Config"]}).to_string()
     }
 
     #[tokio::test]
@@ -1704,10 +1728,11 @@ mod tests {
 
     #[tokio::test]
     async fn without_ctr_no_image_counts_as_pulled_or_built() {
-        let n = nerdctl(FakeRunner::default().on(
+        let mut n = nerdctl(FakeRunner::default().on(
             "image inspect nginx:1.27-alpine",
             ok(fixture("nerdctl_image_inspect.json")),
         ));
+        n.ctr = None;
         let img = n.inspect_image("nginx:1.27-alpine").await.unwrap();
         assert!(img.repo_digests.is_empty(), "nothing to compare");
         assert!(img.source_unknown, "and not mistaken for a local build");
@@ -2210,7 +2235,10 @@ mod tests {
     async fn preflight_tries_the_flags_on_the_image_the_container_runs() {
         let runner = tag_moves_after_first_listing()
             .on(
-                &format!("create --name fd-plain-freshdock-check-* docker.io/library/nginx@{OLD_DIGEST} *"),
+                // Nothing after the image: its command is the image's own.
+                &format!(
+                    "create --name fd-plain-freshdock-check-* docker.io/library/nginx@{OLD_DIGEST}"
+                ),
                 ok("trialid\n"),
             )
             .on(
@@ -2308,21 +2336,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_image_env_is_read_from_its_config_blob() {
+    async fn the_image_config_is_read_from_its_config_blob() {
         let mut n = nerdctl(FakeRunner::default());
-        n.ctr = Some(FakeRunner::default().on(
-            "content get sha256:cfg",
-            ok(r#"{"architecture":"amd64","config":{"Env":["PATH=/bin","PS1=$ "]}}"#),
-        ));
+        n.ctr = Some(
+            FakeRunner::default()
+                .on(
+                    "content get sha256:cfg",
+                    ok(r#"{"architecture":"amd64","config":{"Env":["PATH=/bin","PS1=$ "]}}"#),
+                )
+                .on("content get sha256:garbled", ok("not a config")),
+        );
+        let config = n.image_config(Some("sha256:cfg")).await.unwrap();
         assert_eq!(
-            n.image_env(Some("sha256:cfg")).await,
+            config.env,
             Some(vec!["PATH=/bin".to_owned(), "PS1=$ ".to_owned()])
         );
-        assert_eq!(n.image_env(None).await, None);
-        assert_eq!(n.image_env(Some("not-a-digest")).await, None);
+        assert_eq!(n.image_config(None).await, None);
+        assert_eq!(n.image_config(Some("not-a-digest")).await, None);
+        assert_eq!(n.image_config(Some("sha256:garbled")).await, None);
         // Without ctr nothing is known, so nothing is left to the image.
         n.ctr = None;
-        assert_eq!(n.image_env(Some("sha256:cfg")).await, None);
+        assert_eq!(n.image_config(Some("sha256:cfg")).await, None);
+    }
+
+    #[tokio::test]
+    async fn an_update_is_refused_when_the_image_config_cant_be_read() {
+        let mut n = nerdctl(inspectable("fd-full", "full"));
+        n.ctr = None;
+        let spec = n.inspect("fd-full").await.unwrap();
+        let nerdctl = spec.nerdctl().unwrap();
+        assert!(nerdctl.image_config_unknown);
+        assert!(
+            nerdctl.unsupported.is_empty(),
+            "a dependent's repair from the same image still may: {:?}",
+            nerdctl.unsupported
+        );
+        let err = n.preflight_recreate(&spec).await.unwrap_err();
+        assert!(matches!(err, DockerError::Unsupported(_)), "{err}");
+        assert!(
+            err.to_string()
+                .contains("could not read the config of the image"),
+            "{err}"
+        );
+        assert!(
+            !n.runner.calls().iter().any(|c| c.starts_with("create ")),
+            "refused before the trial"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_leaves_the_images_own_settings_to_the_image() {
+        let n = nerdctl(inspectable("fd-full", "full"));
+        let spec = n.inspect("fd-full").await.unwrap();
+        let nerdctl = spec.nerdctl().unwrap();
+        assert!(!nerdctl.image_config_unknown);
+        assert_eq!(nerdctl.entrypoint, None, "nginx's own entrypoint");
+        assert!(nerdctl.args.is_empty(), "and command");
+        assert_eq!(nerdctl.env, ["FOO=bar", "EMPTY="]);
+        assert!(
+            n.ctr
+                .as_ref()
+                .unwrap()
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("content get sha256:")),
+            "read from the config of the image it runs"
+        );
     }
 
     const RATE_LIMITED: &str = "time=\"2026-10-13T04:00:28Z\" level=fatal msg=\"failed to copy: \

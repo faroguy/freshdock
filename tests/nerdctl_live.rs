@@ -7,7 +7,8 @@
 //! turned red by a host without nerdctl. With the variable set, an unreachable
 //! nerdctl is a failure, not a skip.
 //!
-//! Needs rootful nerdctl (2.3+), so run the test binary as root:
+//! Needs rootful nerdctl (2.3+), and BuildKit for the tests that build
+//! images, so run the test binary as root:
 //!
 //! ```bash
 //! bin=$(cargo test --locked --test nerdctl_live --no-run --message-format=json \
@@ -882,6 +883,124 @@ async fn siblings_on_a_tag_that_moves_are_both_updated() {
         !records.lines().any(|l| l.contains(&old_digest)),
         "no record of the old image is left: {records}"
     );
+}
+
+/// Build `dockerfile` as `tag` in the staging namespace and push it,
+/// retrying while a freshly started registry comes up. Needs BuildKit.
+fn build_and_publish(dockerfile: &str, tag: &str) {
+    let dir = std::env::temp_dir().join(format!(
+        "fdl-build-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Dockerfile"), dockerfile).unwrap();
+    let built = staging(&["build", "--quiet", "-t", tag, &dir.display().to_string()]);
+    std::fs::remove_dir_all(&dir).ok();
+    built.unwrap_or_else(|e| panic!("build {tag} (is BuildKit running?): {e}"));
+    let mut last = String::new();
+    for _ in 0..20 {
+        match staging(&["push", tag]) {
+            Ok(_) => return,
+            Err(e) => last = e,
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!("push {tag}: {last}");
+}
+
+#[tokio::test]
+#[ignore = "needs rootful nerdctl; set FRESHDOCK_NERDCTL_LIVE=1"]
+async fn an_updated_container_gets_its_new_images_own_settings() {
+    // Inspect shows an image's settings merged into the container's. An
+    // update must leave them to the new image, and keep only what the
+    // container set itself (#115 review).
+    let Some(n) = backend().await else { return };
+    let p = prefix("img");
+    let tag = "127.0.0.1:15002/freshdock-live/defaults:v";
+    // Declared first so it drops last, after the containers using it.
+    let _images = ImageTeardown(tag);
+    let _teardown = Teardown {
+        prefix: p.clone(),
+        networks: vec![],
+    };
+    must(&[
+        "run",
+        "-d",
+        "--name",
+        &format!("{p}-registry"),
+        "-p",
+        "127.0.0.1:15002:5000",
+        "docker.io/library/registry:2",
+    ]);
+    let version = |v: &str, only: &str, entrypoint: &str| {
+        format!(
+            "FROM {ALPINE}\n\
+             ENV SHARED={v} {only}=1\n\
+             LABEL org.example.version={v} org.example.shared={v}\n\
+             USER {uid}\n\
+             WORKDIR /{v}\n\
+             STOPSIGNAL {signal}\n\
+             HEALTHCHECK --interval=2s CMD test -d /{v}\n\
+             ENTRYPOINT {entrypoint}\n\
+             CMD [\"sleep 100000 # {v}\"]\n",
+            uid = if v == "v1" { 4321 } else { 1234 },
+            signal = if v == "v1" { "SIGUSR1" } else { "SIGUSR2" },
+        )
+    };
+    build_and_publish(&version("v1", "OLD_ONLY", r#"["/bin/sh", "-c"]"#), tag);
+    must(&["pull", "--quiet", tag]);
+    let name = format!("{p}-app");
+    #[rustfmt::skip]
+    must(&[
+        "run", "-d", "--name", &name, "--label", "freshdock.enable=true",
+        // The container's own settings, one of them over the image's.
+        "-e", "MINE=1", "-e", "SHARED=mine", "--label", "org.example.shared=mine",
+        tag,
+    ]);
+    // Upstream publishes v2 under the same tag; the update pulls it.
+    build_and_publish(&version("v2", "NEW_ONLY", r#"["/bin/sh", "-ec"]"#), tag);
+
+    let outcome = recreate(&n, &name).await.expect("recreate");
+    assert!(
+        matches!(outcome, RecreateOutcome::Recreated { .. }),
+        "{outcome:?}"
+    );
+    let c = inspect(&name).expect("the container exists under its name");
+    assert_eq!(c["Path"], "/bin/sh");
+    assert_eq!(
+        c["Args"],
+        serde_json::json!(["-ec", "sleep 100000 # v2"]),
+        "v2's entrypoint and command"
+    );
+    let env: Vec<&str> = c["Config"]["Env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for want in ["MINE=1", "SHARED=mine", "NEW_ONLY=1"] {
+        assert!(env.contains(&want), "missing {want}: {env:?}");
+    }
+    assert!(
+        !env.iter().any(|v| v.starts_with("OLD_ONLY=")),
+        "a variable only v1 set is gone: {env:?}"
+    );
+    let labels = &c["Config"]["Labels"];
+    assert_eq!(labels["org.example.version"], "v2");
+    assert_eq!(labels["org.example.shared"], "mine");
+    assert_eq!(labels["io.containerd.image.config.stop-signal"], "SIGUSR2");
+    let health: Value =
+        serde_json::from_str(labels["nerdctl/healthcheck"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        health["Test"],
+        serde_json::json!(["CMD-SHELL", "test -d /v2"])
+    );
+    assert_eq!(c["Config"]["User"], "1234");
+    let after = native(&name);
+    assert_eq!(after["Spec"]["process"]["cwd"], "/v2");
+    assert!(running(&name));
 }
 
 /// The manifest digest a tag points at, as the registry serves it.

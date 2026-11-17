@@ -118,6 +118,7 @@ jobs:
       # bundle's. Replace it with the nerdctl-full bundle (containerd, CNI and
       # nerdctl together); its unit in /usr/local takes precedence over the
       # packaged one. The download is checked against the pinned NERDCTL_SHA256.
+      # The bundle's BuildKit lets the tests build images (`nerdctl build`).
       - name: Install nerdctl (full bundle)
         run: |
           base="https://github.com/containerd/nerdctl/releases/download/v${NERDCTL_VERSION}"
@@ -128,6 +129,7 @@ jobs:
           sudo tar -C /usr/local -xzf "$file"
           sudo systemctl daemon-reload
           sudo systemctl restart containerd
+          sudo systemctl start buildkit
           sudo nerdctl version
 
       # Runs the #[ignore]d nerdctl tests as root; they opt in through
