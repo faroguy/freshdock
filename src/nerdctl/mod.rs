@@ -231,7 +231,7 @@ impl<R: CommandRunner> Nerdctl<R> {
                     error = %e,
                     "cannot run containerd's ctr, so freshdock cannot tell pulled images from \
                      local builds; it will report containers but update none. Install ctr next \
-                     to nerdctl or on PATH"
+                     to nerdctl or on PATH, then restart freshdock"
                 );
                 self.ctr = None;
             }

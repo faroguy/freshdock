@@ -313,7 +313,7 @@ If that line names the wrong namespace, and `check` lists none of your container
 set `FRESHDOCK_CONTAINERD_NAMESPACE` to the one you use with `nerdctl --namespace`.
 
 ```
-WARN freshdock::nerdctl: cannot run containerd's ctr, so freshdock cannot tell pulled images from local builds; it will report containers but update none. Install ctr next to nerdctl or on PATH
+WARN freshdock::nerdctl: cannot run containerd's ctr, so freshdock cannot tell pulled images from local builds; it will report containers but update none. Install ctr next to nerdctl or on PATH, then restart freshdock
 ```
 
 Until it can run `ctr`, `freshdock check` shows every container as
@@ -325,6 +325,11 @@ freshdock looks for `ctr` in the directory of `FRESHDOCK_NERDCTL_PATH`, then on
 `PATH`. If containerd listens somewhere other than
 `/run/containerd/containerd.sock` (an `address` in `nerdctl.toml`), set
 `CONTAINERD_ADDRESS` for the service so `ctr` finds it too.
+
+The daemon checks for `ctr` only when it starts, so after installing `ctr` or
+fixing its connection, restart it (`systemctl restart freshdock`). Until then it
+keeps updating nothing, and the warning above is gone from the next start's log
+once `ctr` works.
 
 ## nerdctl: an update was refused
 
