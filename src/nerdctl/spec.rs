@@ -124,20 +124,33 @@ impl ImageConfig {
     /// From a config blob (`ctr content get <config digest>`); `None` when it
     /// is not one. A blob without a `config` section is an image that sets
     /// nothing.
+    ///
+    /// The healthcheck is the config's `Healthcheck`, or, without one, the
+    /// image's `nerdctl/healthcheck` label: nerdctl gives a container either,
+    /// the field first (seen with nerdctl 2.3.4). A label it can't read is
+    /// no healthcheck.
     pub fn from_blob(blob: &str) -> Option<Self> {
         let parsed: Value = serde_json::from_str(blob).ok()?;
         if !parsed.is_object() {
             return None;
         }
-        match parsed.get("config") {
-            None | Some(Value::Null) => Some(Self::default()),
-            Some(config) => serde_json::from_value(config.clone()).ok(),
+        let mut config: Self = match parsed.get("config") {
+            None | Some(Value::Null) => return Some(Self::default()),
+            Some(config) => serde_json::from_value(config.clone()).ok()?,
+        };
+        if config.healthcheck.is_none() {
+            config.healthcheck = config
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("nerdctl/healthcheck"))
+                .and_then(|raw| serde_json::from_str(raw).ok());
         }
+        Some(config)
     }
 }
 
 /// What nerdctl uses for a healthcheck timing the image leaves unset, and
-/// records as if it had been given (seen for `Retries` with nerdctl 2.3.4).
+/// records as if it had been given (seen with nerdctl 2.3.4).
 const HEALTHCHECK_DEFAULTS: (i64, i64, i64, i64) = (30_000_000_000, 30_000_000_000, 0, 3);
 
 /// Is the container's healthcheck the image's own? An unset image timing
@@ -1691,6 +1704,69 @@ mod tests {
         );
         assert_eq!(ImageConfig::from_blob("not json"), None);
         assert_eq!(ImageConfig::from_blob("[]"), None);
+    }
+
+    #[test]
+    fn an_images_healthcheck_label_counts_when_it_has_no_healthcheck() {
+        // Raw config blobs as nerdctl 2.3.4 meets them: an image built with
+        // only `LABEL nerdctl/healthcheck=...`, which nerdctl applies to its
+        // containers, and one with both, where the field wins.
+        let label =
+            r#"{\"Test\":[\"CMD-SHELL\",\"test -d /from-label\"],\"Interval\":11000000000}"#;
+        let label_only =
+            format!(r#"{{"config":{{"Labels":{{"nerdctl/healthcheck":"{label}"}}}}}}"#);
+        let both = format!(
+            r#"{{"config":{{"Labels":{{"nerdctl/healthcheck":"{label}"}},
+                "Healthcheck":{{"Test":["CMD-SHELL","test -d /from-field"]}}}}}}"#
+        );
+        let test_of = |blob: &str| {
+            ImageConfig::from_blob(blob)
+                .unwrap()
+                .healthcheck
+                .and_then(|h| h.test)
+        };
+        assert_eq!(
+            test_of(&label_only),
+            Some(vec![
+                "CMD-SHELL".to_owned(),
+                "test -d /from-label".to_owned()
+            ])
+        );
+        let config = ImageConfig::from_blob(&label_only).unwrap();
+        assert_eq!(config.healthcheck.unwrap().interval, Some(11_000_000_000));
+        assert_eq!(
+            test_of(&both),
+            Some(vec![
+                "CMD-SHELL".to_owned(),
+                "test -d /from-field".to_owned()
+            ])
+        );
+        // Neither, or a label nerdctl couldn't read either: none.
+        assert_eq!(test_of(r#"{"config":{"Labels":{"a":"b"}}}"#), None);
+        assert_eq!(
+            test_of(r#"{"config":{"Labels":{"nerdctl/healthcheck":"not json"}}}"#),
+            None
+        );
+        // So a container running the label's check leaves it to the image.
+        let spec = against(
+            serde_json::json!({"Config": {"Labels": {"nerdctl/healthcheck":
+                r#"{"Test":["CMD-SHELL","test -d /from-label"],"Interval":11000000000,"Timeout":30000000000,"Retries":3}"#
+            }}}),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        assert!(!spec.flags.is_empty(), "an image without one: kept");
+        let image = ImageConfig::from_blob(&label_only).unwrap();
+        let spec = NerdctlSpec::from_inspect(
+            serde_json::from_value(serde_json::json!({"Config": {"Labels": {"nerdctl/healthcheck":
+                r#"{"Test":["CMD-SHELL","test -d /from-label"],"Interval":11000000000,"Timeout":30000000000,"Retries":3}"#
+            }}}))
+            .unwrap(),
+            NativeInspect::default(),
+            None,
+            Some(&image),
+        );
+        assert!(spec.flags.is_empty(), "{:?}", spec.flags);
     }
 
     #[test]

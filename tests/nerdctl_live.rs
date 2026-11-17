@@ -968,11 +968,18 @@ async fn an_updated_container_gets_its_new_images_own_settings() {
              USER {uid}\n\
              WORKDIR /{v}\n\
              STOPSIGNAL {signal}\n\
-             HEALTHCHECK --interval=2s CMD test -d /{v}\n\
+             {healthcheck}\n\
              ENTRYPOINT {entrypoint}\n\
              CMD [\"sleep 100000 # {v}\"]\n",
             uid = if v == "v1" { 4321 } else { 1234 },
             signal = if v == "v1" { "SIGUSR1" } else { "SIGUSR2" },
+            // v1 has its healthcheck as nerdctl's label alone, which nerdctl
+            // applies as well (#115 review).
+            healthcheck = if v == "v1" {
+                r#"LABEL nerdctl/healthcheck="{\"Test\":[\"CMD-SHELL\",\"test -d /v1\"],\"Interval\":2000000000}""#
+            } else {
+                "HEALTHCHECK --interval=2s CMD test -d /v2"
+            },
         )
     };
     build_and_publish(&version("v1", "OLD_ONLY", r#"["/bin/sh", "-c"]"#), tag);
@@ -985,6 +992,13 @@ async fn an_updated_container_gets_its_new_images_own_settings() {
         "-e", "MINE=1", "-e", "SHARED=mine", "--label", "org.example.shared=mine",
         tag,
     ]);
+    let v1_health = inspect(&name).unwrap()["Config"]["Labels"]["nerdctl/healthcheck"].clone();
+    assert!(
+        v1_health
+            .as_str()
+            .is_some_and(|h| h.contains("test -d /v1")),
+        "nerdctl applied v1's healthcheck label: {v1_health}"
+    );
     // Upstream publishes v2 under the same tag; the update pulls it.
     build_and_publish(&version("v2", "NEW_ONLY", r#"["/bin/sh", "-ec"]"#), tag);
 
