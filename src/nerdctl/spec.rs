@@ -968,8 +968,10 @@ impl NerdctlSpec {
         ] {
             if let Some(v) = take(key) {
                 // -1 reads as "unset" for these, except swap, where it means
-                // unlimited: an unset swap limit reads as twice the memory.
-                if v.as_i64() == Some(-1) && key != "MemorySwap" {
+                // unlimited (an unset swap limit reads as twice the memory),
+                // and the OOM score, where it is a score like any other (the
+                // range is -1000 to 1000, unset is 0).
+                if v.as_i64() == Some(-1) && !matches!(key, "MemorySwap" | "OomScoreAdj") {
                     continue;
                 }
                 match value_string(&v) {
@@ -1893,6 +1895,19 @@ mod tests {
         }
         let spec = with_host_config(serde_json::json!({"MemorySwappiness": 60}));
         assert_eq!(spec.flags, ["--memory-swappiness", "60"]);
+    }
+
+    #[test]
+    fn an_oom_score_of_minus_one_is_a_setting() {
+        // As nerdctl 2.3.4 records `--oom-score-adj -1`; unset reads as 0.
+        let spec = with_host_config(serde_json::json!({"OomScoreAdj": -1}));
+        assert!(spec.unsupported.is_empty(), "{:?}", spec.unsupported);
+        assert_eq!(spec.flags, ["--oom-score-adj", "-1"]);
+        let spec = with_host_config(serde_json::json!({"OomScoreAdj": 0}));
+        assert!(spec.flags.is_empty(), "{:?}", spec.flags);
+        // The others keep reading -1 as unset.
+        let spec = with_host_config(serde_json::json!({"PidsLimit": -1, "CpuQuota": -1}));
+        assert!(spec.flags.is_empty(), "{:?}", spec.flags);
     }
 
     #[test]

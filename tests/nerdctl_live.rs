@@ -221,7 +221,7 @@ async fn a_richly_configured_container_round_trips() {
         "--hostname", "rt-host", "--add-host", "example.test:10.0.0.9", "--dns", "9.9.9.9",
         "--cap-add", "NET_ADMIN", "--memory", "256m", "--cpus", "0.5", "--pids-limit", "300",
         // Zero and -1 are settings here, not "unset" (#115 review).
-        "--memory-swappiness", "0", "--memory-swap", "-1",
+        "--memory-swappiness", "0", "--memory-swap", "-1", "--oom-score-adj", "-1",
         // Recorded only in the OCI cgroups path.
         "--cgroup-parent", "freshdock-live.slice",
         "--stop-signal", "SIGQUIT", "--stop-timeout", "20", "--log-opt", "max-size=5m",
@@ -284,6 +284,10 @@ async fn a_richly_configured_container_round_trips() {
     assert_eq!(
         after["Spec"]["linux"]["resources"]["memory"]["swappiness"], 0,
         "zero swappiness carried over"
+    );
+    assert_eq!(
+        after["Spec"]["process"]["oomScoreAdj"], -1,
+        "an OOM score of -1 carried over"
     );
     assert_eq!(
         port_mappings(&name),
