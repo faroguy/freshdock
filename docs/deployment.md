@@ -248,13 +248,17 @@ logs both.
   falling back to Docker.
 - **The running image is remembered from first sight.** containerd records a
   container's image by name only, so freshdock notes which image each container
-  runs when it first lists it, before pulling anything. When containers share a
+  runs when it first lists it, before pulling anything, in
+  `/var/lib/freshdock/nerdctl-seen-images` (root-only). When containers share a
   tag, updating one moves the tag, and the others are still recognised as behind
-  it and updated in turn. What freshdock cannot know is a tag that moved before it
-  first saw the container: a `nerdctl pull` by hand while freshdock was not
-  running, or freshdock restarted after updating one container on a tag but
-  before the others. `check` then reports such a container as up to date until
-  upstream publishes again.
+  it and updated in turn, even after freshdock restarts. The same goes for a
+  container whose update was called off after the pull (a pre-update hook's
+  "not now", a refused or rolled-back update): its next update leaves the
+  settings of the image it really runs to the new one. What freshdock cannot
+  know is a tag that moved before it first saw the container: a `nerdctl pull`
+  by hand before freshdock was installed, or while a container was stopped.
+  `check` then reports such a container as up to date until upstream publishes
+  again.
 
   `freshdock check` is a new process every time, so to it every tag that moved
   is one that moved before it first looked. After the daemon updates one

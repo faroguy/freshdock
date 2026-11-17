@@ -92,11 +92,13 @@ impl KeptStore {
     }
 }
 
-/// Lock `path`, read every namespace's names, apply `f` to `namespace`'s, and
-/// write it back. Created owner-only, in an owner-only directory. On an error
+/// Lock `path`, read every namespace's entries, apply `f` to `namespace`'s, and
+/// write it back. Each line is the namespace, a tab, and the entry; an entry
+/// may hold further tabs. Created owner-only, in an owner-only directory. On an error
 /// `f` may or may not have run; the caller then applies it in memory, which is
-/// safe because every change here (insert, remove, read) is idempotent.
-fn update_file(
+/// safe because every change made through it (insert, remove, read) is
+/// idempotent. Shared with [`SeenStore`](super::seen::SeenStore).
+pub(super) fn update_file(
     path: &Path,
     namespace: &str,
     f: &mut dyn FnMut(&mut BTreeSet<String>),

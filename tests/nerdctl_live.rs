@@ -1043,6 +1043,80 @@ async fn an_updated_container_gets_its_new_images_own_settings() {
     assert!(running(&name));
 }
 
+#[tokio::test]
+#[ignore = "needs rootful nerdctl; set FRESHDOCK_NERDCTL_LIVE=1"]
+async fn a_restarted_freshdock_still_knows_the_image_a_container_runs() {
+    // freshdock pulls v2 but doesn't replace the container (its pre-update
+    // hook says "not now"), then restarts. The container still runs v1, and
+    // its update must leave v1's settings to v2, not v2's (#115 review).
+    let Some(before) = backend().await else {
+        return;
+    };
+    let p = prefix("restart");
+    let tag = "127.0.0.1:15003/freshdock-live/restart:v";
+    // Declared first so it drops last, after the containers using it.
+    let _images = ImageTeardown(tag);
+    let _teardown = Teardown {
+        prefix: p.clone(),
+        networks: vec![],
+    };
+    must(&[
+        "run",
+        "-d",
+        "--name",
+        &format!("{p}-registry"),
+        "-p",
+        "127.0.0.1:15003:5000",
+        "docker.io/library/registry:2",
+    ]);
+    let v1 = format!("FROM {ALPINE}\nENV ONLY_V1=1\nCMD [\"sleep\", \"100001\"]\n");
+    let v2 = format!("FROM {ALPINE}\nCMD [\"sleep\", \"100002\"]\n");
+    build_and_publish(&v1, tag);
+    must(&["pull", "--quiet", tag]);
+    let name = format!("{p}-app");
+    must(&[
+        "run",
+        "-d",
+        "--name",
+        &name,
+        "--label",
+        "freshdock.enable=true",
+        tag,
+    ]);
+    before.list_running().await.unwrap();
+    build_and_publish(&v2, tag);
+    before
+        .pull(&freshdock::registry::ImageRef::parse(tag))
+        .await
+        .expect("pull v2");
+    drop(before);
+
+    // The restarted daemon: the tag names v2, the container runs v1.
+    let after = backend().await.unwrap();
+    let outcome = recreate(&after, &name).await.expect("recreate");
+    assert!(
+        matches!(outcome, RecreateOutcome::Recreated { .. }),
+        "{outcome:?}"
+    );
+    let c = inspect(&name).expect("the container exists under its name");
+    assert_eq!(
+        c["Args"],
+        serde_json::json!(["100002"]),
+        "v2's command, not v1's pinned on: {c}"
+    );
+    let env: Vec<&str> = c["Config"]["Env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        !env.contains(&"ONLY_V1=1"),
+        "a variable only v1 set is gone: {env:?}"
+    );
+    assert!(running(&name));
+}
+
 /// The manifest digest a tag points at, as the registry serves it.
 fn image_digest(reference: &str) -> String {
     let out = must(&["image", "inspect", reference]);

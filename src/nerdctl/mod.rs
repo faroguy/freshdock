@@ -12,6 +12,7 @@ pub mod inspect;
 pub mod kept;
 pub mod private;
 pub mod runner;
+pub mod seen;
 pub mod source;
 pub mod spec;
 
@@ -40,6 +41,7 @@ use self::inspect::{
 use self::kept::{DEFAULT_STATE_FILE, KeptStore};
 use self::private::{PrivateDir, remove_stale_dirs, split_marked, unique_suffix};
 use self::runner::{CmdOutput, CommandRunner, ProcessRunner, RunError, proxy_env};
+use self::seen::{DEFAULT_SEEN_FILE, Seen, SeenStore};
 use self::spec::{CreateInspect, ImageConfig, NativeInspect, NerdctlSpec, NetworkConfig};
 
 /// The oldest nerdctl freshdock is tested against.
@@ -81,10 +83,10 @@ pub struct Nerdctl<R = ProcessRunner> {
     namespace: String,
     credentials: Arc<CredentialStore>,
     /// The image each container ran when freshdock first saw it, by container
-    /// id. containerd records a container's image by name only, so once a
-    /// pull moves the tag there is no other way to tell which image a sibling
-    /// on the same tag still runs. See [`Seen`].
-    seen: std::sync::Mutex<HashMap<String, Seen>>,
+    /// id, kept across restarts (see [`seen`]). containerd records a
+    /// container's image by name only, so once a pull moves the tag there is
+    /// no other way to tell which image a container on it still runs.
+    seen: SeenStore,
     /// Listed containers whose image could not be looked up yet, by id, with
     /// the reference they run. Not in `seen`, so the lookup is tried again on
     /// the next pass; until it succeeds, nothing that could hide their image
@@ -101,17 +103,6 @@ pub struct Nerdctl<R = ProcessRunner> {
     housekeeping: std::sync::atomic::AtomicBool,
 }
 
-/// One image, as nerdctl can be asked for it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Seen {
-    /// The config digest `image inspect` reports as `Id`: what the update
-    /// check compares against the tag's (see `probe::behind_tag`).
-    id: Option<String>,
-    /// A digest-pinned reference (`docker.io/library/nginx@sha256:...`), the
-    /// handle `nerdctl create` and `rmi` accept for one specific image.
-    pinned: Option<String>,
-}
-
 impl Nerdctl<ProcessRunner> {
     /// Check that nerdctl runs, is new enough and can reach containerd, so a
     /// broken setup fails at startup rather than midway through an update.
@@ -125,6 +116,7 @@ impl Nerdctl<ProcessRunner> {
             credentials,
         );
         nerdctl.kept = KeptStore::persistent(&settings.containerd_namespace, DEFAULT_STATE_FILE);
+        nerdctl.seen = SeenStore::persistent(&settings.containerd_namespace, DEFAULT_SEEN_FILE);
         warn_unless_root();
         nerdctl.check_version().await?;
         let ctr = source::ctr_path(std::path::Path::new(&settings.nerdctl_path));
@@ -137,12 +129,13 @@ impl Nerdctl<ProcessRunner> {
 impl<R: CommandRunner> Nerdctl<R> {
     pub fn with_runner(runner: R, namespace: String, credentials: Arc<CredentialStore>) -> Self {
         let kept = KeptStore::in_memory(&namespace);
+        let seen = SeenStore::in_memory(&namespace);
         Self {
             runner,
             ctr: None,
             namespace,
             credentials,
-            seen: std::sync::Mutex::new(HashMap::new()),
+            seen,
             unidentified: std::sync::Mutex::new(HashMap::new()),
             kept,
             housekeeping: std::sync::atomic::AtomicBool::new(false),
@@ -359,10 +352,7 @@ impl<R: CommandRunner> DockerCheck for Nerdctl<R> {
         }
         let live: std::collections::HashSet<&str> =
             listed.iter().filter_map(|c| c.id.as_deref()).collect();
-        self.seen
-            .lock()
-            .unwrap()
-            .retain(|id, _| live.contains(id.as_str()));
+        self.seen.retain(&live);
         self.unidentified
             .lock()
             .unwrap()
@@ -554,9 +544,8 @@ impl<R: CommandRunner> Nerdctl<R> {
         }
         let runners = self
             .seen
-            .lock()
-            .unwrap()
             .values()
+            .iter()
             .filter(|s| s.pinned.as_deref().and_then(digest_of) == digest_of(&pinned))
             .count();
         if runners == 0 {
@@ -648,9 +637,8 @@ impl<R: CommandRunner> Nerdctl<R> {
         }
         let needed: std::collections::HashSet<String> = self
             .seen
-            .lock()
-            .unwrap()
             .values()
+            .iter()
             .filter_map(|s| s.pinned.as_deref().and_then(digest_of).map(str::to_owned))
             .collect();
         let stale: Vec<String> = self
@@ -677,11 +665,12 @@ impl<R: CommandRunner> Nerdctl<R> {
         }
     }
 
-    /// The image container `id` runs: what it was first seen with, or, on
-    /// first sight, what its tag points at now (recorded from then on).
+    /// The image container `id` runs: what it was first seen with (by this
+    /// process, an earlier one, or another freshdock), or, on first sight,
+    /// what its tag points at now (recorded from then on).
     async fn image_of(&self, id: &str, reference: &str) -> Seen {
-        if let Some(seen) = self.seen.lock().unwrap().get(id) {
-            return seen.clone();
+        if let Some(seen) = self.seen.get(id) {
+            return seen;
         }
         // A lookup that failed is not remembered as "nothing": it is tried
         // again on the next pass (see `unidentified`).
@@ -693,10 +682,7 @@ impl<R: CommandRunner> Nerdctl<R> {
             return Seen::default();
         };
         self.unidentified.lock().unwrap().remove(id);
-        self.seen
-            .lock()
-            .unwrap()
-            .insert(id.to_owned(), seen.clone());
+        self.seen.insert(id, seen.clone());
         seen
     }
 
@@ -1223,11 +1209,10 @@ impl<R: CommandRunner> DockerOps for Nerdctl<R> {
             }
             let runners: Vec<String> = self
                 .seen
-                .lock()
-                .unwrap()
-                .iter()
+                .entries()
+                .into_iter()
                 .filter(|(_, s)| s.pinned.as_deref().and_then(digest_of) == Some(digest))
-                .map(|(cid, _)| cid.clone())
+                .map(|(cid, _)| cid)
                 .collect();
             if !runners.is_empty() {
                 let existing = self.call(&["ps", "-a", "--no-trunc", "-q"]).await?;
@@ -1826,6 +1811,14 @@ mod tests {
     /// fd-plain, first listed while its tag points at the old image, which a
     /// sibling's pull then moves to the new one.
     fn tag_moves_after_first_listing() -> FakeRunner {
+        tag_moved().on_once(
+            &format!("image inspect {IMAGE}"),
+            ok(image_json("sha256:old", OLD_DIGEST)),
+        )
+    }
+
+    /// The same, once the tag has moved: it names only the new image.
+    fn tag_moved() -> FakeRunner {
         FakeRunner::default()
             .on("ps --no-trunc -q", ok(format!("{PLAIN_ID}\n")))
             .on(
@@ -1839,10 +1832,6 @@ mod tests {
             .on(
                 "inspect --mode=native fd-plain",
                 ok(fixture("nerdctl_plain_native.json")),
-            )
-            .on_once(
-                &format!("image inspect {IMAGE}"),
-                ok(image_json("sha256:old", OLD_DIGEST)),
             )
             .on(
                 &format!("image inspect {IMAGE}"),
@@ -1862,8 +1851,8 @@ mod tests {
     /// Record that containers `ids` were first seen running the old image.
     fn seen_running_old(n: &Nerdctl<FakeRunner>, ids: &[&str]) {
         for id in ids {
-            n.seen.lock().unwrap().insert(
-                (*id).to_owned(),
+            n.seen.insert(
+                id,
                 Seen {
                     id: Some("sha256:old".to_owned()),
                     pinned: Some(format!("docker.io/library/nginx@{OLD_DIGEST}")),
@@ -1942,8 +1931,8 @@ mod tests {
 
         // Updated at last: the container now runs the new image, and the
         // kept name goes.
-        n.seen.lock().unwrap().insert(
-            PLAIN_ID.to_owned(),
+        n.seen.insert(
+            PLAIN_ID,
             Seen {
                 id: Some("sha256:new".to_owned()),
                 pinned: Some(format!("docker.io/library/nginx@{NEW_DIGEST}")),
@@ -2091,8 +2080,8 @@ mod tests {
         let pinned = format!("docker.io/library/nginx@{OLD_DIGEST}");
         let n =
             nerdctl(FakeRunner::default().on("ps -a --no-trunc -q", ok(format!("{NETDEP_ID}\n"))));
-        n.seen.lock().unwrap().insert(
-            NETDEP_ID.to_owned(),
+        n.seen.insert(
+            NETDEP_ID,
             Seen {
                 id: Some("sha256:old".to_owned()),
                 pinned: Some(pinned.clone()),
@@ -2113,8 +2102,8 @@ mod tests {
         n.housekeeping
             .store(true, std::sync::atomic::Ordering::Relaxed);
         // A listed container still runs the new image, spelled differently.
-        n.seen.lock().unwrap().insert(
-            PLAIN_ID.to_owned(),
+        n.seen.insert(
+            PLAIN_ID,
             Seen {
                 id: None,
                 pinned: Some(format!("nginx@{NEW_DIGEST}")),
@@ -2123,6 +2112,51 @@ mod tests {
         n.release_kept_images().await;
         assert_eq!(n.runner.calls(), [format!("rmi {old}")]);
         assert_eq!(n.kept.names(), [new].into_iter().collect());
+    }
+
+    #[tokio::test]
+    async fn a_restart_keeps_the_image_a_container_was_first_seen_running() {
+        // freshdock pulled, the tag moved, but the container was not replaced
+        // (its hook said "not now"); then freshdock restarted (#115 review).
+        let dir = private::PrivateDir::new("seen-restart").unwrap();
+        let file = dir.path().join("seen");
+        let mut before = nerdctl(tag_moves_after_first_listing());
+        before.seen = SeenStore::persistent(NS, &file);
+        before.list_running().await.unwrap();
+        drop(before);
+
+        // The new process: the tag names only the new image now.
+        let mut after = nerdctl(tag_moved());
+        after.seen = SeenStore::persistent(NS, &file);
+        assert_eq!(
+            after.local_image_id(IMAGE).await.unwrap(),
+            Some(format!("docker.io/library/nginx@{NEW_DIGEST}")),
+            "the tag names the new image"
+        );
+        let listed = after.list_running().await.unwrap();
+        assert_eq!(
+            listed[0].image_id.as_deref(),
+            Some("sha256:old"),
+            "still seen behind its tag"
+        );
+        let spec = after.inspect("fd-plain").await.unwrap();
+        assert_eq!(
+            spec.image_id,
+            Some(format!("docker.io/library/nginx@{OLD_DIGEST}"))
+        );
+        let reads: Vec<String> = after
+            .ctr
+            .as_ref()
+            .unwrap()
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("content get"))
+            .collect();
+        assert_eq!(
+            reads,
+            ["content get sha256:old"],
+            "the settings are told apart with the old image's config"
+        );
     }
 
     #[tokio::test]
@@ -2267,9 +2301,9 @@ mod tests {
                 .on_once("ps --no-trunc -q", ok("")),
         );
         n.list_running().await.unwrap();
-        assert_eq!(n.seen.lock().unwrap().len(), 1);
+        assert_eq!(n.seen.len(), 1);
         n.list_running().await.unwrap();
-        assert!(n.seen.lock().unwrap().is_empty());
+        assert!(n.seen.is_empty());
     }
 
     #[tokio::test]
