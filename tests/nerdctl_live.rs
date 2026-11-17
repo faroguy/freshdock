@@ -29,6 +29,7 @@ use freshdock::docker::check::DockerCheck;
 use freshdock::docker::recreate::{Cleanup, DockerOps, recreate_with_health};
 use freshdock::health::{HealthConfig, TokioClock};
 use freshdock::labels::LifecycleHooks;
+use freshdock::nerdctl::inspect::classify_error;
 use freshdock::nerdctl::private::unique_suffix;
 use freshdock::nerdctl::{Nerdctl, compare};
 use freshdock::updater::RecreateOutcome;
@@ -66,12 +67,22 @@ fn must(args: &[&str]) -> String {
     nerdctl(args).unwrap_or_else(|e| panic!("nerdctl {}: {e}", args.join(" ")))
 }
 
+/// The container's inspect, or `None` when nerdctl says there is no such
+/// container. Any other failure panics, so an inspect that broke never
+/// passes for a container that is gone.
 fn inspect(name: &str) -> Option<Value> {
-    let out = nerdctl(&["inspect", name]).ok()?;
-    serde_json::from_str::<Vec<Value>>(&out)
-        .ok()?
-        .into_iter()
-        .next()
+    match nerdctl(&["inspect", name]) {
+        Ok(out) => {
+            let listed = serde_json::from_str::<Vec<Value>>(&out)
+                .unwrap_or_else(|e| panic!("nerdctl inspect {name}: {e}: {out}"));
+            match listed.into_iter().next() {
+                Some(c) => Some(c),
+                None => panic!("nerdctl inspect {name} listed nothing"),
+            }
+        }
+        Err(e) if classify_error(e.clone()).is_not_found() => None,
+        Err(e) => panic!("nerdctl inspect {name}: {e}"),
+    }
 }
 
 fn native(name: &str) -> Value {
@@ -129,10 +140,12 @@ struct Teardown {
 impl Drop for Teardown {
     fn drop(&mut self) {
         let names = nerdctl(&["ps", "-a", "--format", "{{.Names}}"]).unwrap_or_default();
+        // `--volumes`: and their anonymous volumes, such as the one each
+        // test registry's image declares.
         for name in names.lines().filter(|n| n.starts_with(&self.prefix)) {
             let _ = nerdctl(&["stop", "--time", "1", name]);
-            if nerdctl(&["rm", name]).is_err() {
-                let _ = nerdctl(&["rm", "--force", name]);
+            if nerdctl(&["rm", "--volumes", name]).is_err() {
+                let _ = nerdctl(&["rm", "--force", "--volumes", name]);
             }
         }
         for net in &self.networks {
@@ -403,10 +416,10 @@ async fn a_crashing_replacement_is_rolled_back() {
     };
     let name = format!("{p}-app");
     // Stays up only while /tmp/ok exists in its own writable layer, which a
-    // replacement never has.
+    // replacement never has. The marker is copied in before the first start,
+    // so the original never looks for it too early.
     must(&[
-        "run",
-        "-d",
+        "create",
         "--name",
         &name,
         "--label",
@@ -414,10 +427,19 @@ async fn a_crashing_replacement_is_rolled_back() {
         ALPINE,
         "sh",
         "-c",
-        "sleep 2; while [ -f /tmp/ok ]; do sleep 1; done; exit 3",
+        "while [ -f /tmp/ok ]; do sleep 1; done; exit 3",
     ]);
-    must(&["exec", &name, "touch", "/tmp/ok"]);
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let marker = std::env::temp_dir().join(format!("{p}-ok"));
+    std::fs::write(&marker, "").unwrap();
+    let copied = nerdctl(&[
+        "cp",
+        &marker.display().to_string(),
+        &format!("{name}:/tmp/ok"),
+    ]);
+    std::fs::remove_file(&marker).ok();
+    copied.unwrap_or_else(|e| panic!("nerdctl cp: {e}"));
+    must(&["start", &name]);
+    assert!(running(&name), "the original runs on its marker");
     let before_id = id_of(&name).unwrap();
 
     let outcome = recreate(&n, &name).await.expect("recreate");
