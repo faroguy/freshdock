@@ -1117,6 +1117,99 @@ async fn a_restarted_freshdock_still_knows_the_image_a_container_runs() {
     assert!(running(&name));
 }
 
+#[tokio::test]
+#[ignore = "needs rootful nerdctl; set FRESHDOCK_NERDCTL_LIVE=1"]
+async fn a_tag_moved_before_freshdock_saw_the_container_is_noticed() {
+    // `nerdctl pull` by hand moves two tags before any freshdock has listed
+    // the containers on them. Their filesystems still tell their image: one
+    // that kept another name is found and updated from properly; one with no
+    // name left can't be told, and is left alone (#115 review).
+    let Some(n) = backend().await else { return };
+    let p = prefix("moved");
+    let told = "127.0.0.1:15004/freshdock-live/told:v";
+    let lost = "127.0.0.1:15004/freshdock-live/lost:v";
+    // Declared first so they drop last, after the containers using them.
+    let _told_images = ImageTeardown(told);
+    let _lost_images = ImageTeardown(lost);
+    let _teardown = Teardown {
+        prefix: p.clone(),
+        networks: vec![],
+    };
+    must(&[
+        "run",
+        "-d",
+        "--name",
+        &format!("{p}-registry"),
+        "-p",
+        "127.0.0.1:15004:5000",
+        "docker.io/library/registry:2",
+    ]);
+    // A layer of each version's own, as a real release has: images with the
+    // same layers sit on the same filesystem and can't be told apart. Each
+    // repository's are its own too, or BuildKit's cache would make them one
+    // image, kept alive by the other's name.
+    let v1 = |tag: &str| {
+        format!(
+            "FROM {ALPINE}\nRUN echo {tag} v1 > /version\nENV ONLY_V1=1\n\
+             CMD [\"sleep\", \"100001\"]\n"
+        )
+    };
+    let v2 = |tag: &str| {
+        format!("FROM {ALPINE}\nRUN echo {tag} v2 > /version\nCMD [\"sleep\", \"100002\"]\n")
+    };
+    let mut names = Vec::new();
+    for tag in [told, lost] {
+        build_and_publish(&v1(tag), tag);
+        must(&["pull", "--quiet", tag]);
+        let name = format!("{p}-{}", if tag == told { "told" } else { "lost" });
+        must(&[
+            "run",
+            "-d",
+            "--name",
+            &name,
+            "--label",
+            "freshdock.enable=true",
+            tag,
+        ]);
+        names.push(name);
+    }
+    let (told_name, lost_name) = (&names[0], &names[1]);
+    // The told one's v1 keeps a name of its own; the lost one's has none.
+    must(&["tag", told, "127.0.0.1:15004/freshdock-live/told:keep"]);
+    for tag in [told, lost] {
+        build_and_publish(&v2(tag), tag);
+        must(&["pull", "--quiet", tag]);
+    }
+
+    let outcome = recreate(&n, told_name).await.expect("recreate told");
+    assert!(
+        matches!(outcome, RecreateOutcome::Recreated { .. }),
+        "{outcome:?}"
+    );
+    let c = inspect(told_name).expect("the container exists under its name");
+    assert_eq!(
+        c["Args"],
+        serde_json::json!(["100002"]),
+        "v2's command, v1's not pinned on: {c}"
+    );
+    let env = c["Config"]["Env"].to_string();
+    assert!(
+        !env.contains("ONLY_V1"),
+        "a variable only v1 set is gone: {env}"
+    );
+
+    let lost_before = id_of(lost_name).unwrap();
+    let err = recreate(&n, lost_name)
+        .await
+        .expect_err("refused: its image can't be told");
+    assert!(
+        err.to_string().contains("could not tell which image"),
+        "{err}"
+    );
+    assert_eq!(id_of(lost_name).as_deref(), Some(lost_before.as_str()));
+    assert!(running(lost_name), "left alone");
+}
+
 /// The manifest digest a tag points at, as the registry serves it.
 fn image_digest(reference: &str) -> String {
     let out = must(&["image", "inspect", reference]);

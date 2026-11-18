@@ -13,6 +13,7 @@ pub mod kept;
 pub mod private;
 pub mod runner;
 pub mod seen;
+pub mod snapshot;
 pub mod source;
 pub mod spec;
 
@@ -592,10 +593,33 @@ impl<R: CommandRunner> Nerdctl<R> {
         {
             return Ok(tag.to_owned());
         }
+        // Another name of the same image: a tag of the user's, say, which is
+        // how an image told from a container's filesystem may be found (see
+        // `image_under`).
+        if let Some(name) = self.other_name_of(image).await {
+            return Ok(name);
+        }
         Err(DockerError::Unsupported(format!(
             "the image {image} is no longer available locally, and freshdock only \
              creates containers from local images"
         )))
+    }
+
+    /// A local name, of the same repository, for the image the digest
+    /// reference `image` names; `None` when there is none.
+    async fn other_name_of(&self, image: &str) -> Option<String> {
+        let (repo, digest) = image.rsplit_once('@')?;
+        let want = crate::registry::familiar_repository(repo);
+        let listing = self
+            .call(&["images", "--no-trunc", "--format", "{{.Name}}\t{{.Digest}}"])
+            .await
+            .ok()?;
+        listing.lines().find_map(|line| {
+            let (name, d) = line.split_once('\t')?;
+            let name_repo = crate::probe::strip_tag(name.split('@').next().unwrap_or(name));
+            (d.trim() == digest && crate::registry::familiar_repository(name_repo) == want)
+                .then(|| name.to_owned())
+        })
     }
 
     /// List the running containers, so their images are known (see
@@ -667,23 +691,151 @@ impl<R: CommandRunner> Nerdctl<R> {
 
     /// The image container `id` runs: what it was first seen with (by this
     /// process, an earlier one, or another freshdock), or, on first sight,
-    /// what its tag points at now (recorded from then on).
+    /// what its tag points at now, checked against the container's
+    /// filesystem (see [`snapshot`]); recorded from then on.
+    ///
+    /// When the filesystem shows another image, that image is used if it can
+    /// still be found, and otherwise none: the container is then reported
+    /// but not updated, rather than updated as if it ran the tag's image.
     async fn image_of(&self, id: &str, reference: &str) -> Seen {
         if let Some(seen) = self.seen.get(id) {
             return seen;
         }
         // A lookup that failed is not remembered as "nothing": it is tried
         // again on the next pass (see `unidentified`).
-        let Some(seen) = self.try_identify(reference).await else {
+        let unidentified = || {
             self.unidentified
                 .lock()
                 .unwrap()
                 .insert(id.to_owned(), reference.to_owned());
-            return Seen::default();
+            Seen::default()
         };
+        let Some(mut seen) = self.try_identify(reference).await else {
+            return unidentified();
+        };
+        // A digest reference already names the one image.
+        if !reference.contains('@')
+            && let Some(tag_config) = seen.id.clone()
+        {
+            let under = self.configs_under(id).await;
+            debug!(container = %id, image = %reference, tag_config = %tag_config, filesystem_on = ?under, "telling a container's image from its filesystem");
+            match under {
+                Err(e) => {
+                    debug!(container = %id, error = %e, "could not read the container's filesystem to tell its image");
+                    return unidentified();
+                }
+                Ok(None) => {}
+                Ok(Some(configs)) if configs.contains(&tag_config) => {}
+                Ok(Some(configs)) => seen = self.image_under(id, reference, &configs).await,
+            }
+        }
         self.unidentified.lock().unwrap().remove(id);
         self.seen.insert(id, seen.clone());
         seen
+    }
+
+    /// The configs of the images container `id`'s filesystem sits on (see
+    /// [`snapshot`]). `Ok(None)` when there is nothing to go by: no `ctr`,
+    /// or no snapshot recorded. `Err` when `ctr` failed, which may pass.
+    async fn configs_under(&self, id: &str) -> Result<Option<Vec<String>>, String> {
+        if self.ctr.is_none() {
+            return Ok(None);
+        }
+        let info = self.ctr_call(&["containers", "info", id]).await?;
+        let Some(fs) = snapshot::container_snapshot(&info) else {
+            return Ok(None);
+        };
+        let info = self
+            .ctr_call(&[
+                "snapshots",
+                "--snapshotter",
+                &fs.snapshotter,
+                "info",
+                &fs.key,
+            ])
+            .await?;
+        let Some(parent) = snapshot::snapshot_parent(&info) else {
+            return Ok(None);
+        };
+        let filter = snapshot::configs_on(&fs.snapshotter, &parent);
+        let listed = self.ctr_call(&["content", "ls", "-q", &filter]).await?;
+        Ok(Some(snapshot::digests(&listed)))
+    }
+
+    /// Container `id` runs none of the images its tag `reference` names, but
+    /// one of `configs`: that image, with a name nerdctl can create it from,
+    /// when exactly one config is left and a local image of the same
+    /// repository has it. Nothing otherwise.
+    async fn image_under(&self, id: &str, reference: &str, configs: &[String]) -> Seen {
+        let short = id.get(..12).unwrap_or(id);
+        let [config] = configs else {
+            warn!(
+                container = %short,
+                image = %reference,
+                "the container runs an image its tag no longer names, and freshdock can't tell \
+                 which (it was removed, or several images share its layers), so it won't update \
+                 the container; re-create it from its tag to put it back on its tag's image"
+            );
+            return Seen::default();
+        };
+        let pinned = self.record_of(config, reference).await;
+        info!(
+            container = %short,
+            image = %reference,
+            runs = %pinned.as_deref().unwrap_or(config),
+            "the container runs an older image than its tag names, told from its filesystem"
+        );
+        Seen {
+            id: Some(config.clone()),
+            pinned,
+        }
+    }
+
+    /// A digest reference for the local image of `reference`'s repository
+    /// whose config is `config`, so a trial can be created from it. `None`
+    /// when no image record has it.
+    async fn record_of(&self, config: &str, reference: &str) -> Option<String> {
+        let repository = crate::probe::strip_tag(reference.split('@').next().unwrap_or(reference));
+        let listing = self
+            .call(&[
+                "images",
+                "--no-trunc",
+                "--format",
+                "{{.Name}}\t{{.Digest}}\t{{.Platform}}",
+            ])
+            .await
+            .inspect_err(|e| debug!(error = %e, "could not list images to find a container's"))
+            .ok()?;
+        for line in listing.lines() {
+            let mut fields = line.split('\t');
+            let (Some(name), Some(digest)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            let platform = fields.next().filter(|p| !p.is_empty());
+            let name = name.split('@').next().unwrap_or(name);
+            if crate::probe::strip_tag(name) != repository || !digest.starts_with("sha256:") {
+                continue;
+            }
+            let Ok(blob) = self.ctr_call(&["content", "get", digest]).await else {
+                continue;
+            };
+            let manifests = match snapshot::target(&blob, platform) {
+                Some(snapshot::Target::Config(c)) if c == config => {
+                    return Some(format!("{repository}@{digest}"));
+                }
+                Some(snapshot::Target::Manifests(m)) => m,
+                _ => continue,
+            };
+            for manifest in manifests {
+                if let Ok(blob) = self.ctr_call(&["content", "get", &manifest]).await
+                    && snapshot::target(&blob, platform)
+                        == Some(snapshot::Target::Config(config.to_owned()))
+                {
+                    return Some(format!("{repository}@{digest}"));
+                }
+            }
+        }
+        None
     }
 
     /// `nerdctl create` from a spec, returning the new container's id. The
@@ -986,10 +1138,10 @@ impl<R: CommandRunner> DockerOps for Nerdctl<R> {
         // apart.
         if nerdctl.image_config_unknown {
             return Err(DockerError::Unsupported(format!(
-                "freshdock could not read the config of the image {} runs, so it can't tell \
-                 the image's own settings from the container's, and carrying them all over \
-                 would keep the old image's values over the new one's; it was not updated. \
-                 It is tried again on the next pass",
+                "freshdock could not tell which image {} runs, or could not read the config \
+                 of the image it runs, so it can't tell the image's own settings from the \
+                 container's, and carrying them all over would keep the old image's values \
+                 over the new one's; it was not updated. It is tried again on the next pass",
                 spec.name
             )));
         }
@@ -1555,6 +1707,8 @@ mod tests {
         n.ctr = Some(
             FakeRunner::default()
                 .on("content get sha256:*", ok(fixture_image_config()))
+                // No snapshot recorded: nothing to tell the image by.
+                .on("containers info *", ok("{}"))
                 .on("*", fail("ctr is not available")),
         );
         n
@@ -2059,6 +2213,13 @@ mod tests {
                 .on(
                     &format!("image inspect {IMAGE}"),
                     ok(image_json("sha256:new", NEW_DIGEST)),
+                )
+                .on(
+                    "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                    ok(format!(
+                        "{IMAGE}\t{NEW_DIGEST}\n\
+                         docker.io/library/alpine:3.20\t{OLD_DIGEST}\n"
+                    )),
                 ),
         );
         let err = n.local_image(&pinned, IMAGE).await.unwrap_err();
@@ -2072,6 +2233,31 @@ mod tests {
                 .calls()
                 .iter()
                 .any(|c| c.starts_with("tag ") || c.starts_with("pull "))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_image_is_created_from_another_name_it_has() {
+        // The old image kept a tag of the user's when its own moved on.
+        let pinned = format!("docker.io/library/nginx@{OLD_DIGEST}");
+        let n = nerdctl(
+            FakeRunner::default()
+                .on("images --format {{.Name}}", ok(format!("{IMAGE}\n")))
+                .on(
+                    &format!("image inspect {IMAGE}"),
+                    ok(image_json("sha256:new", NEW_DIGEST)),
+                )
+                .on(
+                    "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                    ok(format!(
+                        "{IMAGE}\t{NEW_DIGEST}\n\
+                         docker.io/library/nginx:keep\t{OLD_DIGEST}\n"
+                    )),
+                ),
+        );
+        assert_eq!(
+            n.local_image(&pinned, IMAGE).await.unwrap(),
+            "docker.io/library/nginx:keep"
         );
     }
 
@@ -2157,6 +2343,151 @@ mod tests {
             ["content get sha256:old"],
             "the settings are told apart with the old image's config"
         );
+    }
+
+    /// A `ctr` that finds fd-plain's filesystem on the image configs
+    /// `configs` lists (`ctr content ls -q`), then answers `extra`.
+    fn filesystem_on(configs: &str, extra: FakeRunner) -> FakeRunner {
+        let mut ctr = FakeRunner::default()
+            .on(
+                &format!("containers info {PLAIN_ID}"),
+                ok(r#"{"Snapshotter":"overlayfs","SnapshotKey":"k1"}"#),
+            )
+            .on(
+                "snapshots --snapshotter overlayfs info k1",
+                ok(r#"{"Kind":"Active","Parent":"sha256:top"}"#),
+            )
+            .on(
+                r#"content ls -q labels."containerd.io/gc.ref.snapshot.overlayfs"==sha256:top"#,
+                ok(configs),
+            );
+        ctr.script.extend(extra.script);
+        ctr.on("content get sha256:*", ok(fixture_image_config()))
+            .on("*", fail("ctr is not available"))
+    }
+
+    #[tokio::test]
+    async fn the_tags_image_is_checked_against_the_containers_filesystem() {
+        let mut n = nerdctl(tag_moved());
+        n.ctr = Some(filesystem_on("sha256:new\n", FakeRunner::default()));
+        let listed = n.list_running().await.unwrap();
+        assert_eq!(listed[0].image_id.as_deref(), Some("sha256:new"));
+        assert!(
+            n.ctr
+                .as_ref()
+                .unwrap()
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("content ls")),
+            "the filesystem was looked at"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_container_left_on_an_older_image_is_told_from_its_filesystem() {
+        // A tag that moved before freshdock first saw the container: a pull
+        // by hand while it was stopped, say. The old image is still kept
+        // under its digest (an index, as registries serve most images).
+        let mut n = nerdctl(tag_moved().on(
+            "images --no-trunc --format *",
+            ok(format!(
+                "{IMAGE}\t{NEW_DIGEST}\tlinux/amd64\n\
+                 docker.io/library/nginx@{OLD_DIGEST}\t{OLD_DIGEST}\tlinux/amd64\n\
+                 docker.io/library/alpine:3.20\tsha256:other\tlinux/amd64\n"
+            )),
+        ));
+        n.ctr = Some(filesystem_on(
+            "sha256:old\n",
+            FakeRunner::default()
+                .on(
+                    &format!("content get {NEW_DIGEST}"),
+                    ok(r#"{"config":{"digest":"sha256:new"}}"#),
+                )
+                .on(
+                    &format!("content get {OLD_DIGEST}"),
+                    ok(r#"{"manifests":[
+                        {"digest":"sha256:oldarm","platform":{"os":"linux","architecture":"arm64"}},
+                        {"digest":"sha256:oldamd","platform":{"os":"linux","architecture":"amd64"}}]}"#),
+                )
+                .on(
+                    "content get sha256:oldamd",
+                    ok(r#"{"config":{"digest":"sha256:old"}}"#),
+                ),
+        ));
+        let listed = n.list_running().await.unwrap();
+        assert_eq!(
+            listed[0].image_id.as_deref(),
+            Some("sha256:old"),
+            "seen behind its tag, so it is updated"
+        );
+        let spec = n.inspect("fd-plain").await.unwrap();
+        assert_eq!(
+            spec.image_id,
+            Some(format!("docker.io/library/nginx@{OLD_DIGEST}")),
+            "with a name the trial can be created from"
+        );
+        let ctr_calls = n.ctr.as_ref().unwrap().calls();
+        assert!(
+            ctr_calls.contains(&"content get sha256:old".to_owned()),
+            "its settings are told apart with the old image's config: {ctr_calls:?}"
+        );
+        assert!(
+            !ctr_calls.iter().any(|c| c.contains("sha256:other")),
+            "another repository's images are not looked at"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_container_whose_image_cant_be_told_is_not_updated() {
+        // Its old image has no name left, so containerd removed its config
+        // and the filesystem leads nowhere; or several images share its
+        // layers.
+        for configs in ["", "sha256:old\nsha256:older\n"] {
+            let mut n = nerdctl(tag_moved());
+            n.ctr = Some(filesystem_on(configs, FakeRunner::default()));
+            let listed = n.list_running().await.unwrap();
+            assert_eq!(listed[0].image_id, None, "no update check: {configs:?}");
+            let spec = n.inspect("fd-plain").await.unwrap();
+            assert!(spec.nerdctl().unwrap().image_config_unknown);
+            let err = n.preflight_recreate(&spec).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("could not tell which image fd-plain runs"),
+                "{err}"
+            );
+            assert!(n.unidentified.lock().unwrap().is_empty(), "not tried again");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_filesystem_ctr_cant_read_is_tried_again() {
+        let mut n = nerdctl(tag_moved());
+        n.ctr = Some(
+            FakeRunner::default()
+                .on_once(
+                    &format!("containers info {PLAIN_ID}"),
+                    fail("connection refused"),
+                )
+                .on(
+                    &format!("containers info {PLAIN_ID}"),
+                    ok(r#"{"Snapshotter":"overlayfs","SnapshotKey":"k1"}"#),
+                )
+                .on(
+                    "snapshots --snapshotter overlayfs info k1",
+                    ok(r#"{"Parent":"sha256:top"}"#),
+                )
+                .on("content ls -q *", ok("sha256:new\n"))
+                .on("*", fail("ctr is not available")),
+        );
+        let listed = n.list_running().await.unwrap();
+        assert_eq!(listed[0].image_id, None);
+        assert!(
+            n.unidentified.lock().unwrap().contains_key(PLAIN_ID),
+            "held back as a failed lookup"
+        );
+        let listed = n.list_running().await.unwrap();
+        assert_eq!(listed[0].image_id.as_deref(), Some("sha256:new"));
+        assert!(n.unidentified.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2408,8 +2739,7 @@ mod tests {
         let err = n.preflight_recreate(&spec).await.unwrap_err();
         assert!(matches!(err, DockerError::Unsupported(_)), "{err}");
         assert!(
-            err.to_string()
-                .contains("could not read the config of the image"),
+            err.to_string().contains("could not tell which image"),
             "{err}"
         );
         assert!(

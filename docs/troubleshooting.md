@@ -366,7 +366,7 @@ container is not running when freshdock looks, and neither nerdctl's
 lists them. It is tried again on the next pass.
 
 ```
-Error: not supported: freshdock could not read the config of the image web runs, so it can't tell the image's own settings from the container's ...
+Error: not supported: freshdock could not tell which image web runs, or could not read the config of the image it runs, so it can't tell the image's own settings from the container's ...
 ```
 
 freshdock leaves the image's own settings (its `ENV`, labels, command and so
@@ -374,6 +374,17 @@ on) to the new image, which needs the old image's config, read with `ctr`. It
 can't be read when `ctr` doesn't work (see
 [above](#nerdctl-could-not-reach-containerd)), or when containerd was too busy
 to answer; the update is tried again on the next pass.
+
+It also happens when the container's tag moved before freshdock first saw it,
+and the image the container really runs has no name left. The log then says,
+once:
+
+```
+WARN freshdock::nerdctl: the container runs an image its tag no longer names, and freshdock can't tell which ...
+```
+
+Re-create the container from its tag to put it back on its tag's image. The
+container keeps running untouched until then.
 
 A container an earlier freshdock updated may still carry the old image's
 values from before this was fixed (an old version number in its environment,

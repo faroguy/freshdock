@@ -254,11 +254,16 @@ logs both.
   it and updated in turn, even after freshdock restarts. The same goes for a
   container whose update was called off after the pull (a pre-update hook's
   "not now", a refused or rolled-back update): its next update leaves the
-  settings of the image it really runs to the new one. What freshdock cannot
-  know is a tag that moved before it first saw the container: a `nerdctl pull`
-  by hand before freshdock was installed, or while a container was stopped.
-  `check` then reports such a container as up to date until upstream publishes
-  again.
+  settings of the image it really runs to the new one. A tag that moved before
+  freshdock first saw the container (a `nerdctl pull` by hand before freshdock
+  was installed, say) is caught from the container's filesystem, which sits on
+  its image's layers (read with `ctr`): if that image still has a name, freshdock
+  updates the container from it as usual. If it has none left (containerd then
+  removes it), or other images share its layers, freshdock can't tell which image
+  the container runs. It warns once and leaves the container alone until you
+  re-create it from its tag. Only an image with exactly the same layers as the
+  tag's (a rebuild that changed nothing but `ENV` or labels) passes for the
+  tag's.
 
   `freshdock check` is a new process every time, so to it every tag that moved
   is one that moved before it first looked. After the daemon updates one
