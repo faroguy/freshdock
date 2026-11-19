@@ -786,9 +786,13 @@ impl<R: CommandRunner> Nerdctl<R> {
                 }
                 Ok(None) => {}
                 Ok(Some(configs)) if configs == [tag_config.clone()] => {}
-                Ok(Some(configs)) => {
-                    seen = self.image_under(id, reference, &configs, seen).await;
-                }
+                Ok(Some(configs)) => match self.image_under(id, reference, &configs, seen).await {
+                    Ok(found) => seen = found,
+                    Err(e) => {
+                        debug!(container = %id, error = %e, "could not look up the images the container's filesystem sits on");
+                        return unidentified();
+                    }
+                },
             }
         }
         self.unidentified.lock().unwrap().remove(id);
@@ -837,22 +841,30 @@ impl<R: CommandRunner> Nerdctl<R> {
     ///   another, so the tag's is taken if it is among them.
     ///
     /// The image found is returned with a name nerdctl can create it from,
-    /// when a local image of the same repository has it. Nothing when none
-    /// is left (the image was removed), or several that differ are: then
-    /// the container is not updated.
-    async fn image_under(&self, id: &str, reference: &str, configs: &[String], tag: Seen) -> Seen {
+    /// a local image of the same repository's. Nothing when none is left
+    /// (the image was removed), when several that differ are, or when the
+    /// one found has no such name (neither a trial nor a repair could be
+    /// created from it): then the container is not updated. `Err` when a
+    /// lookup failed, which may pass; the caller tries again later.
+    async fn image_under(
+        &self,
+        id: &str,
+        reference: &str,
+        configs: &[String],
+        tag: Seen,
+    ) -> Result<Seen, String> {
         let short = id.get(..12).unwrap_or(id);
-        let ours = self.of_repository(reference, configs).await;
+        let ours = self.of_repository(reference, configs).await?;
         let configs: Vec<String> = ours.iter().map(|(c, _)| c.clone()).collect();
         let (mut candidates, alike) = if configs.len() > 1 {
-            self.configs_fitting(id, &configs).await
+            self.configs_fitting(id, &configs).await?
         } else {
             (configs.clone(), true)
         };
         if alike || candidates.len() == 1 {
             if tag.id.as_ref().is_some_and(|t| candidates.contains(t)) {
                 debug!(container = %short, image = %reference, "the container's filesystem and settings fit its tag's image");
-                return tag;
+                return Ok(tag);
             }
             candidates.truncate(1);
         }
@@ -866,38 +878,53 @@ impl<R: CommandRunner> Nerdctl<R> {
                  out. freshdock won't update it; re-create it from its tag to put it back on \
                  its tag's image"
             );
-            return Seen::default();
+            return Ok(Seen::default());
         };
-        let pinned = ours
+        let Some(pinned) = ours
             .iter()
             .find(|(c, _)| c == config)
-            .and_then(|(_, pinned)| pinned.clone());
+            .and_then(|(_, pinned)| pinned.clone())
+        else {
+            warn!(
+                container = %short,
+                image = %reference,
+                runs = %config,
+                "the container runs an older image than its tag names, and no local image of \
+                 its repository has it, so freshdock can't create a container from it and won't \
+                 update it; re-create it from its tag to put it back on its tag's image"
+            );
+            return Ok(Seen::default());
+        };
         info!(
             container = %short,
             image = %reference,
-            runs = %pinned.as_deref().unwrap_or(config),
+            runs = %pinned,
             "the container runs an older image than its tag names, told from its filesystem"
         );
-        Seen {
+        Ok(Seen {
             id: Some(config.clone()),
-            pinned,
-        }
+            pinned: Some(pinned),
+        })
     }
 
     /// Of `configs`, those container `id`'s settings fit, and whether they
     /// all give their containers the same settings (any is then as good as
     /// another). A config that can't be read can't be ruled out, and is
-    /// alike to none; a container that can't be inspected rules nothing out.
-    async fn configs_fitting(&self, id: &str, configs: &[String]) -> (Vec<String>, bool) {
-        let container = match self.call(&["inspect", id]).await {
-            Ok(out) => serde_json::from_str::<Vec<serde_json::Value>>(&out)
-                .ok()
-                .and_then(|v| v.into_iter().next()),
-            Err(_) => None,
-        };
-        let Some(container) = container else {
-            return (configs.to_vec(), false);
-        };
+    /// alike to none. `Err` when the container can't be inspected.
+    async fn configs_fitting(
+        &self,
+        id: &str,
+        configs: &[String],
+    ) -> Result<(Vec<String>, bool), String> {
+        let out = self
+            .call(&["inspect", id])
+            .await
+            .map_err(|e| e.to_string())?;
+        let container = serde_json::from_str::<Vec<serde_json::Value>>(&out)
+            .map_err(|e| format!("unreadable inspect output: {e}"))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("no such container: {id}"))?;
         let env: Vec<String> = container["Config"]["Env"]
             .as_array()
             .into_iter()
@@ -924,7 +951,7 @@ impl<R: CommandRunner> Nerdctl<R> {
                 .all(|(_, i)| i.as_ref().is_some_and(|i| Some(i) == first));
         let fitting: Vec<String> = fitting.into_iter().map(|(c, _)| c).collect();
         debug!(container = %id, ?fitting, all_alike, "images sharing the container's layers that its settings fit");
-        (fitting, all_alike)
+        Ok((fitting, all_alike))
     }
 
     /// The local images, as `(name, digest, platform)`: `nerdctl images`
@@ -957,27 +984,28 @@ impl<R: CommandRunner> Nerdctl<R> {
     }
 
     /// The configs the image record target `digest` leads to on `platform`:
-    /// a manifest's own, or those of an index's manifests for it. Nothing
-    /// when `ctr` can't read them.
-    async fn configs_of(&self, digest: &str, platform: Option<&str>) -> Vec<String> {
-        let Ok(blob) = self.ctr_call(&["content", "get", digest]).await else {
-            return Vec::new();
-        };
-        match snapshot::target(&blob, platform) {
+    /// a manifest's own, or those of an index's manifests for it. `Err` when
+    /// `ctr` can't read them; nothing when they are in no known format.
+    async fn configs_of(
+        &self,
+        digest: &str,
+        platform: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        let blob = self.ctr_call(&["content", "get", digest]).await?;
+        Ok(match snapshot::target(&blob, platform) {
             Some(snapshot::Target::Config(c)) => vec![c],
             Some(snapshot::Target::Manifests(manifests)) => {
                 let mut configs = Vec::new();
                 for manifest in manifests {
-                    if let Ok(blob) = self.ctr_call(&["content", "get", &manifest]).await
-                        && let Some(snapshot::Target::Config(c)) = snapshot::target(&blob, platform)
-                    {
+                    let blob = self.ctr_call(&["content", "get", &manifest]).await?;
+                    if let Some(snapshot::Target::Config(c)) = snapshot::target(&blob, platform) {
                         configs.push(c);
                     }
                 }
                 configs
             }
             None => Vec::new(),
-        }
+        })
     }
 
     /// Which of `configs` belong to `reference`'s repository, as far as the
@@ -986,12 +1014,14 @@ impl<R: CommandRunner> Nerdctl<R> {
     /// an image adds no layers to, say) can't be its. A config no image names
     /// (one removed, not yet collected) can't be ruled out. Returns those
     /// left, each with a digest reference of the repository's when it has
-    /// one. When the images can't be listed, nothing is ruled out or named.
+    /// one. `Err` when the images can't be listed, which may pass. An image
+    /// whose blobs can't be read is passed over: it names nothing, and rules
+    /// nothing out.
     async fn of_repository(
         &self,
         reference: &str,
         configs: &[String],
-    ) -> Vec<(String, Option<String>)> {
+    ) -> Result<Vec<(String, Option<String>)>, String> {
         let repository = crate::probe::strip_tag(reference.split('@').next().unwrap_or(reference));
         let familiar = |name: &str| {
             let name = name.split('@').next().unwrap_or(name);
@@ -999,21 +1029,23 @@ impl<R: CommandRunner> Nerdctl<R> {
         };
         let want = familiar(repository);
         if configs.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let listing = match self.image_listing().await {
-            Ok(listing) => listing,
-            Err(e) => {
-                debug!(error = %e, "could not list images to find a container's");
-                return configs.iter().map(|c| (c.clone(), None)).collect();
-            }
+        let listing = self.image_listing().await.map_err(|e| e.to_string())?;
+        let configs_of = async |digest: &str, platform: Option<&str>| {
+            self.configs_of(digest, platform)
+                .await
+                .inspect_err(
+                    |e| debug!(image = %digest, error = %e, "could not read an image's config"),
+                )
+                .unwrap_or_default()
         };
         let (ours, others): (Vec<_>, Vec<_>) = listing
             .iter()
             .partition(|(name, _, _)| familiar(name) == want);
         let mut named: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for (_, digest, platform) in ours {
-            for config in self.configs_of(digest, platform.as_deref()).await {
+            for config in configs_of(digest, platform.as_deref()).await {
                 named
                     .entry(config)
                     .or_insert_with(|| format!("{repository}@{digest}"));
@@ -1028,18 +1060,18 @@ impl<R: CommandRunner> Nerdctl<R> {
             if unexplained.is_empty() {
                 break;
             }
-            for config in self.configs_of(digest, platform.as_deref()).await {
+            for config in configs_of(digest, platform.as_deref()).await {
                 if unexplained.contains(&&config) {
                     unexplained.retain(|c| **c != config);
                     foreign.insert(config);
                 }
             }
         }
-        configs
+        Ok(configs
             .iter()
             .filter(|c| !foreign.contains(*c))
             .map(|c| (c.clone(), named.get(c).cloned()))
-            .collect()
+            .collect())
     }
 
     /// `nerdctl create` from a spec, returning the new container's id. The
@@ -2889,6 +2921,84 @@ mod tests {
         ));
         let listed = n.list_running().await.unwrap();
         assert_eq!(listed[0].image_id.as_deref(), Some("sha256:new"));
+    }
+
+    /// fd-plain's filesystem sits on the old image only, after the tag moved.
+    fn on_the_old_image(n: &mut Nerdctl<FakeRunner>) {
+        n.ctr = Some(filesystem_on(
+            "sha256:old\n",
+            FakeRunner::default()
+                .on(
+                    &format!("content get {NEW_DIGEST}"),
+                    ok(r#"{"config":{"digest":"sha256:new"}}"#),
+                )
+                .on(
+                    &format!("content get {OLD_DIGEST}"),
+                    ok(r#"{"config":{"digest":"sha256:old"}}"#),
+                ),
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_of_the_old_images_name_is_tried_again() {
+        // Not noted as "the old image, with no name to create it from" for
+        // good, which would leave preflight trying the tag's (#115 review).
+        let unreachable = "time=\"t\" level=fatal msg=\"failed to dial: connection refused\"\n";
+        let mut n = nerdctl(
+            tag_moved()
+                .on_once("images --no-trunc --format *", fail(unreachable))
+                .on(
+                    "images --no-trunc --format *",
+                    ok(format!(
+                        "{IMAGE}\t{NEW_DIGEST}\tlinux/amd64\n\
+                         docker.io/library/nginx@{OLD_DIGEST}\t{OLD_DIGEST}\tlinux/amd64\n"
+                    )),
+                ),
+        );
+        on_the_old_image(&mut n);
+        let first = n.list_running().await.unwrap();
+        assert_eq!(first[0].image_id, None);
+        assert!(
+            n.unidentified.lock().unwrap().contains_key(PLAIN_ID),
+            "held back as a failed lookup"
+        );
+        let again = n.list_running().await.unwrap();
+        assert_eq!(again[0].image_id.as_deref(), Some("sha256:old"));
+        assert_eq!(
+            n.seen.get(PLAIN_ID).and_then(|s| s.pinned),
+            Some(format!("docker.io/library/nginx@{OLD_DIGEST}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_old_image_with_no_name_left_is_not_noted_as_known() {
+        let dir = private::PrivateDir::new("seen-noname").unwrap();
+        let file = dir.path().join("seen");
+        // Its config is still there, but no image of the repository has it.
+        let mut n = nerdctl(tag_moved().on(
+            "images --no-trunc --format *",
+            ok(format!("{IMAGE}\t{NEW_DIGEST}\tlinux/amd64\n")),
+        ));
+        n.seen = SeenStore::persistent(NS, &file);
+        on_the_old_image(&mut n);
+        let listed = n.list_running().await.unwrap();
+        assert_eq!(listed[0].image_id, None, "not updated");
+        assert!(n.unidentified.lock().unwrap().is_empty(), "an answer");
+        assert_eq!(
+            SeenStore::persistent(NS, &file).get(PLAIN_ID),
+            None,
+            "not written down: looked at again after a restart"
+        );
+        let spec = n.inspect("fd-plain").await.unwrap();
+        let err = n.preflight_recreate(&spec).await.unwrap_err();
+        assert!(
+            err.to_string().contains("could not tell which image"),
+            "{err}"
+        );
+        assert!(
+            !n.runner.calls().iter().any(|c| c.starts_with("create ")),
+            "no trial from the tag's image"
+        );
     }
 
     #[tokio::test]
