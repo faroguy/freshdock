@@ -9,12 +9,13 @@
 //! the old image held on disk for good, indistinguishable from a record a user
 //! made.
 //!
-//! Every change locks the file, rereads it and writes it back, so concurrent
-//! freshdock processes can share it. Where the file can't be used (freshdock
+//! Every change takes a lock, rereads the file and replaces it whole (see
+//! [`update_file`]), so concurrent freshdock processes can share it and a
+//! failed write leaves it as it was. Where the file can't be used (freshdock
 //! not running as root, say) the list falls back to memory, with a warning.
 
 use std::collections::BTreeSet;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -98,18 +99,31 @@ impl KeptStore {
 /// `f` may or may not have run; the caller then applies it in memory, which is
 /// safe because every change made through it (insert, remove, read) is
 /// idempotent. Shared with [`SeenStore`](super::seen::SeenStore).
+///
+/// The lock is held on a separate `<path>.lock`, which is never replaced, and
+/// a change is written to a temporary file that is then renamed over `path`.
+/// So a write that fails part-way (a full disk, an I/O error) leaves the
+/// previous contents, every namespace's, as they were: rewriting `path` in
+/// place would already have truncated them.
 pub(super) fn update_file(
     path: &Path,
     namespace: &str,
     f: &mut dyn FnMut(&mut BTreeSet<String>),
 ) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    if let Some(dir) = dir {
         create_private_dir_all(dir)?;
     }
-    let mut file = open_private(path)?;
-    file.lock()?;
+    let lock = open_private(&sibling(path, ".lock"))?;
+    lock.lock()?;
     let mut body = String::new();
-    file.read_to_string(&mut body)?;
+    match std::fs::File::open(path) {
+        Ok(mut file) => {
+            file.read_to_string(&mut body)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let mut others = Vec::new();
     let mut mine = BTreeSet::new();
     for line in body.lines() {
@@ -136,11 +150,38 @@ pub(super) fn update_file(
         if !out.is_empty() {
             out.push('\n');
         }
-        file.set_len(0)?;
-        file.rewind()?;
-        file.write_all(out.as_bytes())?;
-        file.sync_all()?;
+        replace(path, dir, out.as_bytes())?;
     }
+    Ok(())
+}
+
+/// `path` with `suffix` added to its file name.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Write `body` to a private temporary file next to `path`, sync it, and
+/// rename it over `path`; then sync the directory, so the rename itself
+/// survives a crash. The caller holds the lock, so the temporary name can't
+/// clash with another freshdock process's.
+fn replace(path: &Path, dir: Option<&Path>, body: &[u8]) -> std::io::Result<()> {
+    let tmp = sibling(path, &format!(".tmp-{}", std::process::id()));
+    let written = (|| {
+        let mut file = create_private(&tmp)?;
+        file.write_all(body)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written?;
+    #[cfg(unix)]
+    std::fs::File::open(dir.unwrap_or(Path::new(".")))?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 
@@ -177,6 +218,27 @@ fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
         .write(true)
         .create(true)
         .truncate(false)
+        .open(path)
+}
+
+/// An empty owner-only file at `path`, replacing whatever was left there.
+#[cfg(unix)]
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
         .open(path)
 }
 
@@ -230,7 +292,71 @@ mod tests {
         KeptStore::persistent("ns", &path).insert("repo@sha256:ddd");
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&sibling(&path, ".lock")), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_file_as_it_was() {
+        let dir = PrivateDir::new("keptstore").unwrap();
+        let path = dir.path().join("kept");
+        KeptStore::persistent("a", &path).insert("x@sha256:1");
+        KeptStore::persistent("b", &path).insert("y@sha256:2");
+        let before = std::fs::read_to_string(&path).unwrap();
+        // Something in the way of the temporary file: the write fails after
+        // the old contents were read, which a rewrite in place would already
+        // have truncated.
+        let tmp = sibling(&path, &format!(".tmp-{}", std::process::id()));
+        std::fs::create_dir(&tmp).unwrap();
+        let failed = update_file(&path, "a", &mut |names| {
+            names.insert("x@sha256:3".to_owned());
+        });
+        assert!(failed.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "every namespace's entries survive"
+        );
+        std::fs::remove_dir(&tmp).unwrap();
+        KeptStore::persistent("a", &path).insert("x@sha256:3");
+        assert_eq!(
+            KeptStore::persistent("b", &path).names(),
+            ["y@sha256:2".to_owned()].into()
+        );
+    }
+
+    #[test]
+    fn a_write_leaves_no_temporary_file() {
+        let dir = PrivateDir::new("keptstore").unwrap();
+        let path = dir.path().join("kept");
+        let store = KeptStore::persistent("ns", &path);
+        store.insert("repo@sha256:1");
+        store.remove("repo@sha256:1");
+        let mut left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["kept", "kept.lock"]);
+    }
+
+    #[test]
+    fn concurrent_changes_are_not_lost() {
+        let dir = PrivateDir::new("keptstore").unwrap();
+        let path = dir.path().join("kept");
+        std::thread::scope(|s| {
+            for t in 0..4 {
+                let path = &path;
+                s.spawn(move || {
+                    // A store each, as separate processes would have.
+                    let store = KeptStore::persistent("ns", path);
+                    for n in 0..10 {
+                        store.insert(&format!("repo@sha256:{t}-{n}"));
+                    }
+                });
+            }
+        });
+        assert_eq!(KeptStore::persistent("ns", &path).names().len(), 40);
     }
 
     #[test]

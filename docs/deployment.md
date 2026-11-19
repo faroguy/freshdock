@@ -285,7 +285,9 @@ logs both.
   once if the pull found nothing new). freshdock records the names it made in
   `/var/lib/freshdock/nerdctl-kept-images` (root-only), so a restart, or a
   one-off `freshdock recreate`, doesn't lose track of them: the daemon removes
-  them on a later pass. Names you made yourself are never touched.
+  them on a later pass. Names you made yourself are never touched. Both state
+  files are replaced whole on every change, under a lock on a `.lock` file next
+  to them, so a write that fails (a full disk, say) leaves them as they were.
 - **Registry credentials** from freshdock's configuration are passed to
   `nerdctl pull` through a temporary, owner-only `DOCKER_CONFIG`. Without them,
   nerdctl's own login (`nerdctl login`) is used. See
