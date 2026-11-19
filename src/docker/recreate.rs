@@ -91,6 +91,20 @@ pub trait DockerOps: Sync {
     /// turns `network_mode: service:X` into `container:<id of X>` at create
     /// time, and that id dies with the replaced container.
     async fn list_network_dependents(&self, name: &str) -> Result<Vec<String>, DockerError>;
+    /// Refuse, before `owner` is stopped, an update whose dependents (the
+    /// list the swap will repair) could not be re-created after it. Preflight
+    /// already checked those it saw, but the list is taken again after the
+    /// pull and the pre-update hook, and a dependent started in between has
+    /// been checked by nothing.
+    ///
+    /// Defaulted like [`preflight_recreate`](DockerOps::preflight_recreate).
+    async fn preflight_dependents(
+        &self,
+        _owner: &str,
+        _dependents: &[String],
+    ) -> Result<(), DockerError> {
+        Ok(())
+    }
     /// Every container of a compose project, **including stopped ones** (#78).
     /// `all: true` is the point: an exited one-shot is invisible otherwise.
     ///
@@ -281,6 +295,10 @@ pub async fn recreate_one(
             Vec::new()
         }
     };
+    // The list the swap repairs is the one checked, still before the stop.
+    if !dependents.is_empty() {
+        ops.preflight_dependents(&spec.name, &dependents).await?;
+    }
     // From here on the container is addressed by its INSPECTED name, not the
     // caller's argument: `recreate <id>` must still name the replacement (and
     // the archive) after the real container name, never the id string.
@@ -823,6 +841,8 @@ mod tests {
         dependent_tag_lookup_fails: bool,
         /// `Config.Image` a dependent's `inspect` reports, when not `alpine:3.20`.
         dependent_image_ref: Option<String>,
+        /// When set, `preflight_dependents` refuses (and records the call).
+        refuse_dependents: bool,
     }
 
     impl RecordingOps {
@@ -1161,6 +1181,51 @@ mod tests {
             }
             Ok(self.dependents.clone())
         }
+
+        async fn preflight_dependents(
+            &self,
+            owner: &str,
+            dependents: &[String],
+        ) -> Result<(), DockerError> {
+            if !self.refuse_dependents {
+                return Ok(());
+            }
+            self.record(format!(
+                "preflight_dependents:{owner}:{}",
+                dependents.join(",")
+            ));
+            Err(DockerError::Unsupported(format!(
+                "{owner} shares its network namespace with {}",
+                dependents.join(", ")
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_dependents_the_swap_repairs_are_checked_before_the_stop() {
+        // A dependent started during the pull or the pre-update hook is in
+        // the final list but was never seen by preflight (#115 review).
+        let ops = RecordingOps {
+            refuse_dependents: true,
+            ..RecordingOps::with_dependent("fd-late", "container:fd-smoke")
+        };
+        let err = recreate_one(&ops, "fd-smoke", &LifecycleHooks::default(), || {
+            1_700_000_000
+        })
+        .await
+        .expect_err("refused before the stop");
+        assert!(err.to_string().contains("fd-late"), "{err}");
+        let calls = ops.into_calls();
+        assert!(
+            calls.contains(&"preflight_dependents:fd-smoke:fd-late".to_owned()),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("stop")
+                || c.starts_with("rename")
+                || c.starts_with("create")),
+            "nothing was touched: {calls:?}"
+        );
     }
 
     #[async_trait]

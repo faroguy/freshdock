@@ -1185,8 +1185,18 @@ impl<R: CommandRunner> Nerdctl<R> {
                 return Ok(());
             }
         };
+        self.check_dependents(owner, &dependents).await
+    }
+
+    /// The checks of [`refuse_unreproducible_dependents`](Self::refuse_unreproducible_dependents),
+    /// for the dependents listed.
+    async fn check_dependents(
+        &self,
+        owner: &str,
+        dependents: &[String],
+    ) -> Result<(), DockerError> {
         for dependent in dependents {
-            let spec = match self.inspect(&dependent).await {
+            let spec = match self.inspect(dependent).await {
                 Ok(spec) => spec,
                 Err(e) if e.is_not_found() => continue,
                 Err(e) => return Err(e),
@@ -1200,7 +1210,7 @@ impl<R: CommandRunner> Nerdctl<R> {
                     unsupported.join("; ")
                 )));
             }
-            if let Some(why) = self.repair_source_missing(&dependent, &spec).await? {
+            if let Some(why) = self.repair_source_missing(dependent, &spec).await? {
                 return Err(DockerError::Unsupported(format!(
                     "{owner} shares its network namespace with {dependent}, which would have to \
                      be re-created after the update, but {why}, so {owner} was not updated. It \
@@ -1565,6 +1575,17 @@ impl<R: CommandRunner> DockerOps for Nerdctl<R> {
             spec.name,
             differences.join("; ")
         )))
+    }
+
+    /// The dependents the swap will repair, checked as preflight checks those
+    /// it lists (see [`check_dependents`](Self::check_dependents)). Those
+    /// preflight saw are looked at again, which is cheap next to an update.
+    async fn preflight_dependents(
+        &self,
+        owner: &str,
+        dependents: &[String],
+    ) -> Result<(), DockerError> {
+        self.check_dependents(owner, dependents).await
     }
 
     /// The digest reference `reference` resolves to now. A container's
@@ -4198,6 +4219,28 @@ mod tests {
             !n.runner.calls().iter().any(|c| c.starts_with("create ")),
             "refused before even the trial"
         );
+    }
+
+    #[tokio::test]
+    async fn the_final_dependent_list_is_checked_too() {
+        // fd-netdep appeared after preflight listed the dependents: the swap's
+        // own list is checked the same way before the stop (#115 review).
+        let n = nerdctl(owner_with_dependent(serde_json::json!([
+            "PATH=/bin",
+            "CERT=line one\nline two"
+        ])));
+        let err = n
+            .preflight_dependents("fd-plain", &["fd-netdep".to_owned()])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("CERT has a multi-line value"),
+            "{err}"
+        );
+        let n = nerdctl(owner_with_dependent(serde_json::json!(["PATH=/bin"])));
+        n.preflight_dependents("fd-plain", &["fd-netdep".to_owned()])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -650,7 +650,13 @@ async fn an_owner_whose_dependents_image_is_gone_is_left_alone() {
         .expect_err("refused at preflight");
     let msg = err.to_string();
     assert!(msg.contains(&dependent), "{msg}");
-    assert!(msg.contains("was not updated"), "{msg}");
+    // Refused for its image, not for some other setting: v1 has no name
+    // left and containerd collects its config, so the image can't be told.
+    assert!(
+        msg.contains("can't tell which image it runs")
+            || msg.contains("has no name freshdock can create it from"),
+        "{msg}"
+    );
     assert_eq!(id_of(&owner).as_deref(), Some(owner_before.as_str()));
     assert_eq!(
         id_of(&dependent).as_deref(),
