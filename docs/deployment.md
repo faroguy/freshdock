@@ -263,9 +263,10 @@ logs both.
   removes it), freshdock can't tell which image the container runs. It warns
   once and leaves the container alone until you re-create it from its tag.
   Images with exactly the same layers (a rebuild that changed nothing but `ENV`
-  or labels, or an image that adds no layers to its base) are told apart: an
-  image only other repositories name, or one that sets a variable or label the
-  container lacks, can't be its image. If the ones left
+  or labels, or an image that adds no layers to its base) are told apart: the
+  base of another candidate (its build history is where the other's begins,
+  and no name of the container's repository has it), or an image that sets a
+  variable or label the container lacks, can't be its image. If the ones left
   give their containers the same settings, it makes no difference which it
   runs; if they differ, freshdock warns and leaves the container alone as
   above. A container freshdock itself creates from its tag is noted at once, so

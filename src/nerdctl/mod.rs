@@ -102,6 +102,28 @@ pub struct Nerdctl<R = ProcessRunner> {
     /// [`sweep_or_warn`](Self::sweep_or_warn), which only `run` and `recreate`
     /// call. Never for `check`.
     housekeeping: std::sync::atomic::AtomicBool,
+    /// Blobs `ctr` has read this pass, by digest (see [`blob`](Self::blob)).
+    /// Telling images apart can read every local image's manifests for each
+    /// container; blobs are content-addressed, so a read never goes stale.
+    /// Emptied at each listing, which bounds it to the images of one pass.
+    blobs: std::sync::Mutex<HashMap<String, String>>,
+}
+
+/// Why `ctr` couldn't read a blob.
+#[derive(Debug)]
+enum BlobError {
+    /// containerd has no such blob: an answer, not worth asking again.
+    Missing(String),
+    /// Anything else (a timeout, containerd restarting), which may pass.
+    Failed(String),
+}
+
+impl std::fmt::Display for BlobError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlobError::Missing(e) | BlobError::Failed(e) => f.write_str(e),
+        }
+    }
 }
 
 impl Nerdctl<ProcessRunner> {
@@ -140,6 +162,29 @@ impl<R: CommandRunner> Nerdctl<R> {
             unidentified: std::sync::Mutex::new(HashMap::new()),
             kept,
             housekeeping: std::sync::atomic::AtomicBool::new(false),
+            blobs: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The blob `digest`, as `ctr content get` prints it, from this pass's
+    /// reads when it has been read already. Only a read that worked is kept.
+    async fn blob(&self, digest: &str) -> Result<String, BlobError> {
+        if self.ctr.is_none() {
+            return Err(BlobError::Failed("ctr is not available".to_owned()));
+        }
+        if let Some(blob) = self.blobs.lock().unwrap().get(digest) {
+            return Ok(blob.clone());
+        }
+        match self.ctr_call(&["content", "get", digest]).await {
+            Ok(blob) => {
+                self.blobs
+                    .lock()
+                    .unwrap()
+                    .insert(digest.to_owned(), blob.clone());
+                Ok(blob)
+            }
+            Err(e) if e.to_ascii_lowercase().contains("not found") => Err(BlobError::Missing(e)),
+            Err(e) => Err(BlobError::Failed(e)),
         }
     }
 
@@ -270,7 +315,7 @@ impl<R: CommandRunner> Nerdctl<R> {
     async fn image_config(&self, config: Option<&str>) -> Option<ImageConfig> {
         let config = config.filter(|c| c.starts_with("sha256:"))?;
         let blob = self
-            .ctr_call(&["content", "get", config])
+            .blob(config)
             .await
             .inspect_err(|e| debug!(image = %config, error = %e, "could not read the image config"))
             .ok()?;
@@ -331,6 +376,8 @@ impl<R: CommandRunner> Nerdctl<R> {
 #[async_trait]
 impl<R: CommandRunner> DockerCheck for Nerdctl<R> {
     async fn list_running(&self) -> Result<Vec<ContainerInfo>, DockerError> {
+        // A new pass: the blobs read for the last one go (see `blobs`).
+        self.blobs.lock().unwrap().clear();
         let stdout = self.call(&["ps", "--no-trunc", "-q"]).await?;
         let ids: Vec<&str> = stdout
             .lines()
@@ -995,7 +1042,13 @@ impl<R: CommandRunner> Nerdctl<R> {
             .collect();
         let mut fitting: Vec<(String, Option<ImageConfig>)> = Vec::new();
         for config in configs {
-            let image = self.image_config(Some(config)).await;
+            let image = match self.blob(config).await {
+                Ok(blob) => ImageConfig::from_blob(&blob),
+                Err(BlobError::Missing(_)) => None,
+                Err(BlobError::Failed(e)) => {
+                    return Err(format!("could not read image config {config}: {e}"));
+                }
+            };
             if image.as_ref().is_none_or(|i| i.fits(&env, &labels)) {
                 fitting.push((config.clone(), image));
             }
@@ -1040,20 +1093,20 @@ impl<R: CommandRunner> Nerdctl<R> {
     }
 
     /// The configs the image record target `digest` leads to on `platform`:
-    /// a manifest's own, or those of an index's manifests for it. `Err` when
-    /// `ctr` can't read them; nothing when they are in no known format.
+    /// a manifest's own, or those of an index's manifests for it. Nothing
+    /// when they are in no known format.
     async fn configs_of(
         &self,
         digest: &str,
         platform: Option<&str>,
-    ) -> Result<Vec<String>, String> {
-        let blob = self.ctr_call(&["content", "get", digest]).await?;
+    ) -> Result<Vec<String>, BlobError> {
+        let blob = self.blob(digest).await?;
         Ok(match snapshot::target(&blob, platform) {
             Some(snapshot::Target::Config(c)) => vec![c],
             Some(snapshot::Target::Manifests(manifests)) => {
                 let mut configs = Vec::new();
                 for manifest in manifests {
-                    let blob = self.ctr_call(&["content", "get", &manifest]).await?;
+                    let blob = self.blob(&manifest).await?;
                     if let Some(snapshot::Target::Config(c)) = snapshot::target(&blob, platform) {
                         configs.push(c);
                     }
@@ -1064,15 +1117,20 @@ impl<R: CommandRunner> Nerdctl<R> {
         })
     }
 
-    /// Which of `configs` belong to `reference`'s repository, as far as the
-    /// local images tell: the container was created from a name of that
-    /// repository, so an image only other repositories name (the base image
-    /// an image adds no layers to, say) can't be its. A config no image names
-    /// (one removed, not yet collected) can't be ruled out. Returns those
-    /// left, each with a digest reference of the repository's when it has
-    /// one. `Err` when the images can't be listed, which may pass. An image
-    /// whose blobs can't be read is passed over: it names nothing, and rules
-    /// nothing out.
+    /// Which of `configs` could be container's: the image it was created
+    /// from had a name of `reference`'s repository then, which today's names
+    /// don't show, so a config only other repositories name now can't be
+    /// ruled out for that alone (an old release kept as `backup/app:keep`,
+    /// say). What rules one out is being the base of another candidate, which
+    /// an image that adds no layers of its own shares its filesystem with:
+    /// its build history is a strict prefix of the other's (see
+    /// [`history_extends`]), and no name of this repository has it. Returns
+    /// those left, each with a digest reference of the repository's when it
+    /// has one.
+    ///
+    /// `Err` when the images can't be listed, or a blob can't be read for a
+    /// reason that may pass. An image whose blobs containerd doesn't have is
+    /// passed over: it names nothing, and rules nothing out.
     async fn of_repository(
         &self,
         reference: &str,
@@ -1088,44 +1146,58 @@ impl<R: CommandRunner> Nerdctl<R> {
             return Ok(Vec::new());
         }
         let listing = self.image_listing().await.map_err(|e| e.to_string())?;
-        let configs_of = async |digest: &str, platform: Option<&str>| {
-            self.configs_of(digest, platform)
-                .await
-                .inspect_err(
-                    |e| debug!(image = %digest, error = %e, "could not read an image's config"),
-                )
-                .unwrap_or_default()
+        let configs_of = async |digest: &str, platform: Option<&str>| match self
+            .configs_of(digest, platform)
+            .await
+        {
+            Ok(configs) => Ok(configs),
+            Err(BlobError::Missing(e)) => {
+                debug!(image = %digest, error = %e, "an image's blobs are gone; passing it over");
+                Ok(Vec::new())
+            }
+            Err(BlobError::Failed(e)) => Err(format!("could not read image {digest}: {e}")),
         };
-        let (ours, others): (Vec<_>, Vec<_>) = listing
-            .iter()
-            .partition(|(name, _, _)| familiar(name) == want);
+        let ours = listing.iter().filter(|(name, _, _)| familiar(name) == want);
         let mut named: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for (_, digest, platform) in ours {
-            for config in configs_of(digest, platform.as_deref()).await {
+            for config in configs_of(digest, platform.as_deref()).await? {
                 named
                     .entry(config)
                     .or_insert_with(|| format!("{repository}@{digest}"));
             }
         }
-        // Only what this repository's images leave unexplained is looked up
-        // among the others'.
-        let mut unexplained: Vec<&String> =
-            configs.iter().filter(|c| !named.contains_key(*c)).collect();
-        let mut foreign = std::collections::HashSet::new();
-        for (_, digest, platform) in others {
-            if unexplained.is_empty() {
-                break;
+        // A base image is told by its history; one this repository names may
+        // be what it ran, and keeps its place.
+        let unnamed: Vec<&String> = configs.iter().filter(|c| !named.contains_key(*c)).collect();
+        let mut bases = std::collections::HashSet::new();
+        if !unnamed.is_empty() {
+            let mut histories = HashMap::new();
+            for config in configs {
+                match self.blob(config).await {
+                    Ok(blob) => {
+                        histories.insert(config.clone(), snapshot::history(&blob));
+                    }
+                    Err(BlobError::Missing(_)) => {}
+                    Err(BlobError::Failed(e)) => {
+                        return Err(format!("could not read image config {config}: {e}"));
+                    }
+                }
             }
-            for config in configs_of(digest, platform.as_deref()).await {
-                if unexplained.contains(&&config) {
-                    unexplained.retain(|c| **c != config);
-                    foreign.insert(config);
+            for config in unnamed {
+                let is_base = histories.get(config).is_some_and(|base| {
+                    histories
+                        .iter()
+                        .any(|(other, h)| other != config && history_extends(h, base))
+                });
+                if is_base {
+                    bases.insert(config.clone());
                 }
             }
         }
+        debug!(image = %reference, ?bases, "base images ruled out from the container's filesystem");
         Ok(configs
             .iter()
-            .filter(|c| !foreign.contains(*c))
+            .filter(|c| !bases.contains(*c))
             .map(|c| (c.clone(), named.get(c).cloned()))
             .collect())
     }
@@ -1857,6 +1929,16 @@ impl<R: CommandRunner> DockerOps for Nerdctl<R> {
             crate::selfid::own_container_id_prefix().as_deref(),
         ))
     }
+}
+
+/// Does build history `longer` extend `base`: begin with every one of its
+/// entries, and add more? A child image built `FROM` a base copies the
+/// base's entries as they are (checked with BuildKit on nerdctl 2.3.4); two
+/// rebuilds of one image from the same base share the base's entries and
+/// then differ, so neither extends the other. An empty history extends
+/// nothing and is extended by nothing: it tells nothing.
+fn history_extends(longer: &[serde_json::Value], base: &[serde_json::Value]) -> bool {
+    !base.is_empty() && longer.len() > base.len() && longer.starts_with(base)
 }
 
 /// What [`Nerdctl::record_state`] finds under a digest name.
@@ -3041,32 +3123,147 @@ mod tests {
         assert_eq!(listed[0].image_id.as_deref(), Some("sha256:new"));
     }
 
-    #[tokio::test]
-    async fn an_image_only_another_repository_names_is_not_a_candidate() {
-        // The tag's image adds no layers to its base, so the container's
-        // filesystem sits on the base image too, which it can't be running:
-        // it was created from a name of its own repository.
-        let mut n = nerdctl(tag_moved().on(
-            "images --no-trunc --format *",
-            ok(format!(
-                "{IMAGE}\t{NEW_DIGEST}\tlinux/amd64\n\
-                 docker.io/library/alpine:3.20\tsha256:alp\tlinux/amd64\n"
-            )),
-        ));
+    /// An image config with environment `env` and build history `steps`.
+    fn config_blob(env: &[&str], steps: &[&str]) -> CmdOutput {
+        let history: Vec<serde_json::Value> = steps
+            .iter()
+            .map(|s| serde_json::json!({"created_by": s}))
+            .collect();
+        ok(serde_json::json!({"config": {"Env": env}, "history": history}).to_string())
+    }
+
+    /// fd-plain's filesystem sits on the tag's new image and on `other`,
+    /// whose config is `other_config`; `listing` is the local image list.
+    fn new_image_and(other: &str, other_config: CmdOutput, listing: String) -> Nerdctl<FakeRunner> {
+        let mut n = nerdctl(tag_moved().on("images --no-trunc --format *", ok(listing)));
         n.ctr = Some(filesystem_on(
-            "sha256:base\nsha256:new\n",
+            &format!("{other}\nsha256:new\n"),
             FakeRunner::default()
                 .on(
                     &format!("content get {NEW_DIGEST}"),
                     ok(r#"{"config":{"digest":"sha256:new"}}"#),
                 )
                 .on(
-                    "content get sha256:alp",
-                    ok(r#"{"config":{"digest":"sha256:base"}}"#),
-                ),
+                    "content get sha256:new",
+                    config_blob(
+                        &["PATH=/bin", "NGINX_VERSION=1.27.5"],
+                        &["ADD rootfs", "ENV NGINX_VERSION=1.27.5", "CMD nginx"],
+                    ),
+                )
+                .on(&format!("content get {other}"), other_config),
         ));
+        n
+    }
+
+    #[tokio::test]
+    async fn a_base_image_is_ruled_out_by_its_history() {
+        // The tag's image adds no layers to its base, so the container's
+        // filesystem sits on the base too. The container fits either, but the
+        // base's history is the start of the image's: it is only the base.
+        let n = new_image_and(
+            "sha256:base",
+            config_blob(&["PATH=/bin"], &["ADD rootfs"]),
+            format!(
+                "{IMAGE}\t{NEW_DIGEST}\tlinux/amd64\n\
+                 docker.io/library/alpine:3.20\tsha256:alp\tlinux/amd64\n"
+            ),
+        );
         let listed = n.list_running().await.unwrap();
         assert_eq!(listed[0].image_id.as_deref(), Some("sha256:new"));
+        let reads = n
+            .ctr
+            .as_ref()
+            .unwrap()
+            .calls()
+            .into_iter()
+            .filter(|c| c == "content get sha256:base")
+            .count();
+        assert_eq!(reads, 1, "read once in the pass, then reused");
+    }
+
+    #[tokio::test]
+    async fn an_old_release_another_repository_names_is_still_a_candidate() {
+        // #115 review: the old image, kept only as `backup/nginx:keep`, has
+        // the same layers as the new and another default. Today's names don't
+        // say what the container was created from, and neither history
+        // extends the other: it can't be told, so it isn't updated.
+        let n = new_image_and(
+            "sha256:old",
+            config_blob(
+                &["PATH=/bin", "NGINX_VERSION=1.25.0"],
+                &["ADD rootfs", "ENV NGINX_VERSION=1.25.0", "CMD nginx"],
+            ),
+            format!(
+                "{IMAGE}\t{NEW_DIGEST}\tlinux/amd64\n\
+                 docker.io/backup/nginx:keep\tsha256:bk\tlinux/amd64\n"
+            ),
+        );
+        let listed = n.list_running().await.unwrap();
+        assert_eq!(listed[0].image_id, None, "not taken for the tag's image");
+    }
+
+    #[tokio::test]
+    async fn a_blob_read_that_failed_is_tried_again_and_a_missing_one_passed_over() {
+        let mut n = nerdctl(tag_moved().on(
+            "images --no-trunc --format *",
+            ok(format!(
+                "{IMAGE}\t{NEW_DIGEST}\tlinux/amd64\n\
+                 docker.io/library/nginx@{OLD_DIGEST}\t{OLD_DIGEST}\tlinux/amd64\n\
+                 docker.io/library/nginx:broken\tsha256:gone\tlinux/amd64\n"
+            )),
+        ));
+        let mut ctr = filesystem_on(
+            "sha256:old\n",
+            FakeRunner::default()
+                .on(
+                    &format!("content get {NEW_DIGEST}"),
+                    ok(r#"{"config":{"digest":"sha256:new"}}"#),
+                )
+                .on(
+                    &format!("content get {OLD_DIGEST}"),
+                    ok(r#"{"config":{"digest":"sha256:old"}}"#),
+                )
+                // A record whose blobs containerd lost: an answer.
+                .on(
+                    "content get sha256:gone",
+                    fail("ctr: content digest sha256:gone: not found"),
+                ),
+        );
+        // The old image's record times out once: not "can't tell" for good.
+        ctr = ctr.on_once(
+            &format!("content get {OLD_DIGEST}"),
+            fail("context deadline exceeded"),
+        );
+        n.ctr = Some(ctr);
+        let first = n.list_running().await.unwrap();
+        assert_eq!(first[0].image_id, None);
+        assert!(
+            n.unidentified.lock().unwrap().contains_key(PLAIN_ID),
+            "tried again next pass"
+        );
+        let again = n.list_running().await.unwrap();
+        assert_eq!(again[0].image_id.as_deref(), Some("sha256:old"));
+        assert!(n.unidentified.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_history_extends_only_one_it_begins_with() {
+        let h = |steps: &[&str]| -> Vec<serde_json::Value> {
+            steps
+                .iter()
+                .map(|s| serde_json::json!({"created_by": s}))
+                .collect()
+        };
+        assert!(history_extends(&h(&["a", "b", "c"]), &h(&["a", "b"])));
+        assert!(
+            !history_extends(&h(&["a", "b"]), &h(&["a", "b"])),
+            "not strictly"
+        );
+        assert!(!history_extends(&h(&["a", "x", "c"]), &h(&["a", "b"])));
+        assert!(
+            !history_extends(&h(&["a"]), &h(&[])),
+            "no history tells nothing"
+        );
     }
 
     /// fd-plain's filesystem sits on the old image only, after the tag moved.

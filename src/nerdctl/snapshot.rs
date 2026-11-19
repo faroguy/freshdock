@@ -66,6 +66,15 @@ pub fn digests(listing: &str) -> Vec<String> {
     out
 }
 
+/// The `history` entries of an image config blob, in order; none when it
+/// has no history (or isn't a config).
+pub fn history(blob: &str) -> Vec<Value> {
+    serde_json::from_str::<Value>(blob)
+        .ok()
+        .and_then(|b| b.get("history")?.as_array().cloned())
+        .unwrap_or_default()
+}
+
 /// What an image record's target blob points at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
