@@ -127,17 +127,28 @@ impl ImageConfig {
     ///
     /// The healthcheck is the config's `Healthcheck`, or, without one, the
     /// image's `nerdctl/healthcheck` label: nerdctl gives a container either,
-    /// the field first (seen with nerdctl 2.3.4). A label it can't read is
-    /// no healthcheck.
+    /// the field first (seen with nerdctl 2.3.4). nerdctl decodes the field
+    /// with Go's JSON decoder, which matches keys ignoring case, so
+    /// `healthcheck` or `HealthCheck` counts too, and so do its members in
+    /// any case. A label it can't read is no healthcheck.
     pub fn from_blob(blob: &str) -> Option<Self> {
         let parsed: Value = serde_json::from_str(blob).ok()?;
         if !parsed.is_object() {
             return None;
         }
-        let mut config: Self = match parsed.get("config") {
+        let section = match parsed.get("config") {
             None | Some(Value::Null) => return Some(Self::default()),
-            Some(config) => serde_json::from_value(config.clone()).ok()?,
+            Some(section) => section,
         };
+        let mut config: Self = serde_json::from_value(section.clone()).ok()?;
+        if config.healthcheck.is_none() {
+            config.healthcheck = section
+                .as_object()
+                .into_iter()
+                .flatten()
+                .find(|(k, v)| k.eq_ignore_ascii_case("healthcheck") && !v.is_null())
+                .and_then(|(_, v)| healthcheck_in_any_case(v));
+        }
         if config.healthcheck.is_none() {
             config.healthcheck = config
                 .labels
@@ -167,6 +178,21 @@ impl ImageConfig {
                 .flatten()
                 .all(|(k, _)| labels.contains_key(k))
     }
+}
+
+/// A healthcheck object whose member names may be in any case, as Go's
+/// decoder reads them; `None` when it is no healthcheck.
+fn healthcheck_in_any_case(value: &Value) -> Option<Healthcheck> {
+    const MEMBERS: [&str; 5] = ["Test", "Interval", "Timeout", "Retries", "StartPeriod"];
+    let renamed: serde_json::Map<String, Value> = value
+        .as_object()?
+        .iter()
+        .filter_map(|(k, v)| {
+            let name = MEMBERS.iter().find(|m| m.eq_ignore_ascii_case(k))?;
+            Some(((*name).to_owned(), v.clone()))
+        })
+        .collect();
+    serde_json::from_value(Value::Object(renamed)).ok()
 }
 
 /// What nerdctl uses for a healthcheck timing the image leaves unset, and
@@ -1761,6 +1787,24 @@ mod tests {
                 "test -d /from-field".to_owned()
             ])
         );
+        // The field in another case, as Go's decoder still reads it, wins
+        // over a conflicting label too (#115 review); its members likewise.
+        for key in ["healthcheck", "HealthCheck", "HEALTHCHECK"] {
+            let blob = format!(
+                r#"{{"config":{{"Labels":{{"nerdctl/healthcheck":"{label}"}},
+                    "{key}":{{"test":["CMD-SHELL","test -d /from-field"],"interval":5000000000}}}}}}"#
+            );
+            let check = ImageConfig::from_blob(&blob).unwrap().healthcheck.unwrap();
+            assert_eq!(
+                check.test,
+                Some(vec![
+                    "CMD-SHELL".to_owned(),
+                    "test -d /from-field".to_owned()
+                ]),
+                "{key}"
+            );
+            assert_eq!(check.interval, Some(5_000_000_000), "{key}");
+        }
         // Neither, or a label nerdctl couldn't read either: none.
         assert_eq!(test_of(r#"{"config":{"Labels":{"a":"b"}}}"#), None);
         assert_eq!(

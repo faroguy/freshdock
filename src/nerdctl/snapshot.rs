@@ -84,21 +84,50 @@ pub fn target(blob: &str, platform: Option<&str>) -> Option<Target> {
         return Some(Target::Config(config.to_owned()));
     }
     let manifests = blob.get("manifests")?.as_array()?;
-    let mut wanted = platform.map(|p| p.split('/'));
-    let (os, arch) = match wanted.as_mut() {
-        Some(parts) => (parts.next(), parts.next()),
-        None => (None, None),
-    };
+    let wanted = platform.map(|p| {
+        let mut parts = p.split('/');
+        let os = parts.next().unwrap_or("");
+        let arch = parts.next().unwrap_or("");
+        normalise(os, arch, parts.next().unwrap_or(""))
+    });
     let picked = manifests
         .iter()
         .filter(|m| {
-            let field = |k: &str| m.pointer(&format!("/platform/{k}")).and_then(Value::as_str);
-            os.is_none_or(|os| field("os") == Some(os))
-                && arch.is_none_or(|arch| field("architecture") == Some(arch))
+            let field = |k: &str| {
+                m.pointer(&format!("/platform/{k}"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            };
+            wanted.as_ref().is_none_or(|w| {
+                *w == normalise(field("os"), field("architecture"), field("variant"))
+            })
         })
         .filter_map(|m| m.get("digest")?.as_str().map(str::to_owned))
         .collect();
     Some(Target::Manifests(picked))
+}
+
+/// A platform in one spelling, as containerd's `platforms.Normalize` gives
+/// it, so that equal platforms compare equal: architecture aliases are
+/// folded (`aarch64` is `arm64`, `x86_64` is `amd64`) and default variants
+/// made one (`arm64` and `arm64/v8`, `amd64` and `amd64/v1`, `arm` and
+/// `arm/v7`). A different variant is a different platform: nerdctl wouldn't
+/// pick an `arm/v7` manifest for `arm/v6`.
+fn normalise(os: &str, arch: &str, variant: &str) -> (String, String, String) {
+    let os = os.to_ascii_lowercase();
+    let (arch, variant) = match (arch.to_ascii_lowercase().as_str(), variant) {
+        ("x86_64" | "x86-64" | "amd64", "v1") => ("amd64", String::new()),
+        ("x86_64" | "x86-64" | "amd64", v) => ("amd64", v.to_owned()),
+        ("aarch64" | "arm64", "8" | "v8" | "v8.0") => ("arm64", String::new()),
+        ("aarch64" | "arm64", v) => ("arm64", v.to_owned()),
+        ("armhf", _) => ("arm", "v7".to_owned()),
+        ("armel", _) => ("arm", "v6".to_owned()),
+        ("arm", "" | "7") => ("arm", "v7".to_owned()),
+        ("arm", v @ ("5" | "6" | "8")) => ("arm", format!("v{v}")),
+        ("arm", v) => ("arm", v.to_owned()),
+        (other, v) => return (os, other.to_owned(), v.to_owned()),
+    };
+    (os, arch.to_owned(), variant)
 }
 
 #[cfg(test)]
@@ -168,5 +197,30 @@ mod tests {
             ]))
         );
         assert_eq!(target("{}", None), None);
+    }
+
+    #[test]
+    fn an_index_manifest_is_picked_by_its_cpu_variant_too() {
+        // #115 review: two arm manifests that differ only in variant.
+        let index = r#"{"manifests":[
+            {"digest":"sha256:v6","platform":{"architecture":"arm","os":"linux","variant":"v6"}},
+            {"digest":"sha256:v7","platform":{"architecture":"arm","os":"linux","variant":"v7"}},
+            {"digest":"sha256:a64","platform":{"architecture":"arm64","os":"linux","variant":"v8"}},
+            {"digest":"sha256:amd","platform":{"architecture":"amd64","os":"linux"}}]}"#;
+        let picked = |platform| match target(index, Some(platform)) {
+            Some(Target::Manifests(m)) => m,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(picked("linux/arm/v6"), ["sha256:v6"]);
+        assert_eq!(picked("linux/arm/v7"), ["sha256:v7"]);
+        assert_eq!(picked("linux/arm"), ["sha256:v7"], "arm means arm/v7");
+        assert_eq!(
+            picked("linux/arm64"),
+            ["sha256:a64"],
+            "arm64 means arm64/v8"
+        );
+        assert_eq!(picked("linux/arm64/v8"), ["sha256:a64"]);
+        assert_eq!(picked("linux/amd64/v1"), ["sha256:amd"]);
+        assert!(picked("linux/arm/v5").is_empty());
     }
 }

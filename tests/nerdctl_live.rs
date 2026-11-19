@@ -67,6 +67,52 @@ fn must(args: &[&str]) -> String {
     nerdctl(args).unwrap_or_else(|e| panic!("nerdctl {}: {e}", args.join(" ")))
 }
 
+/// Run containerd's `ctr` (next to nerdctl, else on `PATH`) in the test
+/// namespace; a failure panics.
+fn ctr(args: &[&str]) -> String {
+    let bin = std::path::Path::new(&nerdctl_bin())
+        .parent()
+        .map(|dir| dir.join("ctr"))
+        .filter(|p| p.exists())
+        .map_or_else(|| "ctr".to_owned(), |p| p.display().to_string());
+    let out = Command::new(&bin)
+        .args(["--namespace", NS])
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("could not run {bin}: {e}"));
+    assert!(
+        out.status.success(),
+        "ctr {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// The image configs the container's filesystem sits on, as `ctr` lists
+/// them: what freshdock tells a container's image by.
+fn configs_under(name: &str) -> String {
+    let id = id_of(name).expect("the container exists");
+    let info: Value = serde_json::from_str(&ctr(&["containers", "info", &id])).unwrap();
+    let snapshotter = info["Snapshotter"].as_str().unwrap();
+    let key = info["SnapshotKey"].as_str().unwrap();
+    let snapshot: Value = serde_json::from_str(&ctr(&[
+        "snapshots",
+        "--snapshotter",
+        snapshotter,
+        "info",
+        key,
+    ]))
+    .unwrap();
+    let parent = snapshot["Parent"].as_str().unwrap();
+    ctr(&[
+        "content",
+        "ls",
+        "-q",
+        &format!(r#"labels."containerd.io/gc.ref.snapshot.{snapshotter}"=={parent}"#),
+    ])
+}
+
 /// The container's inspect, or `None` when nerdctl says there is no such
 /// container. Any other failure panics, so an inspect that broke never
 /// passes for a container that is gone.
@@ -1291,6 +1337,18 @@ async fn a_tag_moved_before_freshdock_saw_the_container_is_noticed() {
         build_and_publish(&v2(tag), tag);
         must(&["pull", "--quiet", tag]);
     }
+    // The lost one's v1 now has no name, but containerd removes its config
+    // only when it next collects garbage, which is scheduled, not tied to
+    // the pull. Collect now, and make sure, so what follows tests the
+    // refusal and not containerd's timing.
+    let throwaway = "127.0.0.1:15004/freshdock-live/gc:now";
+    must(&["tag", ALPINE, throwaway]);
+    ctr(&["images", "rm", "--sync", throwaway]);
+    assert_eq!(
+        configs_under(lost_name),
+        "",
+        "v1's config of the lost image is collected"
+    );
 
     let outcome = recreate(&n, told_name).await.expect("recreate told");
     assert!(

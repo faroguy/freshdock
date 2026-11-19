@@ -271,11 +271,11 @@ logs both.
   above. A container freshdock itself creates from its tag is noted at once, so
   this never applies to it.
 
-  `freshdock check` is a new process every time, so to it every tag that moved
-  is one that moved before it first looked. After the daemon updates one
-  container on a shared tag, `check` shows the others as up to date, although
-  the daemon still knows they are behind and updates them on their own
-  schedule. Trust the daemon's log over `check` for those.
+  `freshdock check` reads the same notes, and tells a container it has no note
+  for from its filesystem in the same way, so it reports each container by the
+  image it runs, as the daemon does: a sibling left behind a shared tag shows
+  as behind it. It also writes the notes it makes on first sight to the state
+  file, the same ones the daemon would write. It changes nothing else.
 
   If containerd can't be asked about a container's image (it is restarting,
   say), freshdock asks again on the next pass, and until it has an answer it
