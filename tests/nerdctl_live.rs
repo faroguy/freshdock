@@ -1178,6 +1178,58 @@ async fn a_restarted_freshdock_still_knows_the_image_a_container_runs() {
 
 #[tokio::test]
 #[ignore = "needs rootful nerdctl; set FRESHDOCK_NERDCTL_LIVE=1"]
+async fn a_stopped_container_keeps_its_image_note() {
+    // freshdock pulls v2, the container is stopped and listed while stopped,
+    // then started again. It still runs v1, and only its note says so: v1 and
+    // v2 share their layers, so its filesystem can't (#115 review).
+    let Some(n) = backend().await else { return };
+    let p = prefix("stopped");
+    let tag = "127.0.0.1:15006/freshdock-live/stopped:v";
+    let _images = ImageTeardown(tag);
+    let _teardown = Teardown {
+        prefix: p.clone(),
+        networks: vec![],
+    };
+    #[rustfmt::skip]
+    must(&[
+        "run", "-d", "--name", &format!("{p}-registry"), "-p", "127.0.0.1:15006:5000",
+        "docker.io/library/registry:2",
+    ]);
+    let v1 = format!("FROM {ALPINE}\nENV ONLY_V1=1\nCMD [\"sleep\", \"100001\"]\n");
+    let v2 = format!("FROM {ALPINE}\nCMD [\"sleep\", \"100002\"]\n");
+    build_and_publish(&v1, tag);
+    must(&["pull", "--quiet", tag]);
+    let name = format!("{p}-app");
+    #[rustfmt::skip]
+    must(&["run", "-d", "--name", &name, "--label", "freshdock.enable=true", tag]);
+    n.list_running().await.unwrap();
+    build_and_publish(&v2, tag);
+    n.pull(&freshdock::registry::ImageRef::parse(tag))
+        .await
+        .expect("pull v2");
+    must(&["stop", &name]);
+    n.list_running().await.unwrap();
+    must(&["start", &name]);
+
+    let outcome = recreate(&n, &name).await.expect("recreate");
+    assert!(
+        matches!(outcome, RecreateOutcome::Recreated { .. }),
+        "{outcome:?}"
+    );
+    let c = inspect(&name).expect("the container exists under its name");
+    assert_eq!(
+        c["Args"],
+        serde_json::json!(["100002"]),
+        "v2's command: {c}"
+    );
+    assert!(
+        !c["Config"]["Env"].to_string().contains("ONLY_V1"),
+        "v1's variable was left to v1: {c}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs rootful nerdctl; set FRESHDOCK_NERDCTL_LIVE=1"]
 async fn a_tag_moved_before_freshdock_saw_the_container_is_noticed() {
     // `nerdctl pull` by hand moves two tags before any freshdock has listed
     // the containers on them. Their filesystems still tell their image: one

@@ -249,7 +249,8 @@ logs both.
 - **The running image is remembered from first sight.** containerd records a
   container's image by name only, so freshdock notes which image each container
   runs when it first lists it, before pulling anything, in
-  `/var/lib/freshdock/nerdctl-seen-images` (root-only). When containers share a
+  `/var/lib/freshdock/nerdctl-seen-images` (root-only), and keeps each note until
+  the container is removed, stopped or not. When containers share a
   tag, updating one moves the tag, and the others are still recognised as behind
   it and updated in turn, even after freshdock restarts. The same goes for a
   container whose update was called off after the pull (a pre-update hook's

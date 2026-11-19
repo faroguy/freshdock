@@ -128,14 +128,30 @@ impl SeenStore {
             .insert(container.to_owned(), seen);
     }
 
-    /// Forget every container not in `live` (they are gone, or stopped).
-    pub fn retain(&self, live: &HashSet<&str>) {
-        self.memory
-            .lock()
-            .unwrap()
-            .retain(|c, _| live.contains(c.as_str()));
+    /// Every container with a note: this process's, and those in the file
+    /// (another freshdock's, or from before a restart).
+    pub fn noted(&self) -> HashSet<String> {
+        let mut out: HashSet<String> = self.memory.lock().unwrap().keys().cloned().collect();
         self.change_file(|entries| {
-            entries.retain(|e| Seen::parse(e).is_some_and(|(c, _)| live.contains(c.as_str())));
+            out.extend(
+                entries
+                    .iter()
+                    .filter_map(|e| Seen::parse(e))
+                    .map(|(c, _)| c),
+            );
+        });
+        out
+    }
+
+    /// Forget the containers in `gone`, and only those: a note another
+    /// freshdock process writes meanwhile is left alone.
+    pub fn forget(&self, gone: &HashSet<String>) {
+        if gone.is_empty() {
+            return;
+        }
+        self.memory.lock().unwrap().retain(|c, _| !gone.contains(c));
+        self.change_file(|entries| {
+            entries.retain(|e| Seen::parse(e).is_some_and(|(c, _)| !gone.contains(&c)));
         });
     }
 
@@ -229,7 +245,8 @@ mod tests {
         a.insert("c1", image(1));
         a.insert("c2", image(2));
         b.insert("c1", image(9));
-        a.retain(&["c2"].into_iter().collect());
+        assert_eq!(a.noted(), ["c1".to_owned(), "c2".to_owned()].into());
+        a.forget(&["c1".to_owned()].into());
         let a = SeenStore::persistent("a", &path);
         assert_eq!(a.get("c1"), None);
         assert_eq!(a.get("c2"), Some(image(2)));
@@ -281,7 +298,21 @@ mod tests {
         let store = SeenStore::persistent("ns", "/proc/definitely/not/writable/seen");
         store.insert("c1", image(1));
         assert_eq!(store.get("c1"), Some(image(1)));
-        store.retain(&HashSet::new());
+        store.forget(&["c1".to_owned()].into());
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn a_note_written_after_the_others_were_read_is_not_forgotten() {
+        let dir = PrivateDir::new("seenstore").unwrap();
+        let path = dir.path().join("seen");
+        let daemon = SeenStore::persistent("ns", &path);
+        daemon.insert("gone", image(1));
+        let gone = daemon.noted();
+        // A one-off run notes a new container before the daemon prunes.
+        SeenStore::persistent("ns", &path).insert("new", image(2));
+        daemon.forget(&gone);
+        assert_eq!(daemon.get("gone"), None);
+        assert_eq!(daemon.get("new"), Some(image(2)));
     }
 }

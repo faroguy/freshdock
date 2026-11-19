@@ -353,7 +353,7 @@ impl<R: CommandRunner> DockerCheck for Nerdctl<R> {
         }
         let live: std::collections::HashSet<&str> =
             listed.iter().filter_map(|c| c.id.as_deref()).collect();
-        self.seen.retain(&live);
+        self.forget_gone_containers(&live).await;
         self.unidentified
             .lock()
             .unwrap()
@@ -680,6 +680,47 @@ impl<R: CommandRunner> Nerdctl<R> {
             (d.trim() == digest && crate::registry::familiar_repository(name_repo) == want)
                 .then(|| name.to_owned())
         })
+    }
+
+    /// Forget the notes (see [`Nerdctl::seen`]) of containers that no longer
+    /// exist. A stopped container keeps its note: started again, it still
+    /// runs the image it ran. One missing from the listing is checked once
+    /// more by itself before its note goes, since another freshdock process
+    /// may have created and noted it since.
+    async fn forget_gone_containers(&self, running: &std::collections::HashSet<&str>) {
+        let unlisted: Vec<String> = self
+            .seen
+            .noted()
+            .into_iter()
+            .filter(|c| !running.contains(c.as_str()))
+            .collect();
+        if unlisted.is_empty() {
+            return;
+        }
+        let existing = match self.call(&["ps", "-a", "--no-trunc", "-q"]).await {
+            Ok(out) => out,
+            Err(e) => {
+                debug!(error = %e, "could not list all containers; keeping every image note");
+                return;
+            }
+        };
+        let existing: std::collections::HashSet<&str> = existing.lines().map(str::trim).collect();
+        let mut gone = std::collections::HashSet::new();
+        for container in unlisted {
+            if existing.contains(container.as_str()) {
+                continue;
+            }
+            match self.inspect_container(&container).await {
+                Err(e) if e.is_not_found() => {
+                    gone.insert(container);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    debug!(%container, error = %e, "could not check whether a container is gone; keeping its image note")
+                }
+            }
+        }
+        self.seen.forget(&gone);
     }
 
     /// List the running containers, so their images are known (see
@@ -2017,7 +2058,12 @@ mod tests {
     /// A backend whose `ctr` reads one thing: an image config, every one the
     /// fixture image's (see [`fixture_image_config`]). Anything else fails
     /// as it does with no `ctr` at all. Tests of `ctr` itself set their own.
-    fn nerdctl(runner: FakeRunner) -> Nerdctl<FakeRunner> {
+    fn nerdctl(mut runner: FakeRunner) -> Nerdctl<FakeRunner> {
+        // Unless a test lists every container, none is known to be gone, so
+        // no image note is forgotten (see `forget_gone_containers`).
+        runner
+            .script
+            .push(("ps -a --no-trunc -q".to_owned(), fail("not scripted")));
         let mut n =
             Nerdctl::with_runner(runner, NS.to_owned(), Arc::new(CredentialStore::default()));
         n.ctr = Some(
@@ -3002,6 +3048,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_notes_are_kept_until_the_container_is_gone() {
+        const STOPPED: &str = "5709c1a2e64b5ff3b3b8f0bbf07bd74fe4bbd4bdab3d0c19e05fbd8b7f2b1a10";
+        const LATE: &str = "6e1b0c0d2e3f40516273849a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8";
+        const GONE: &str = "7f2c1d1e3f4051627384950a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8";
+        let n = nerdctl(
+            tag_moved()
+                .on(
+                    "ps -a --no-trunc -q",
+                    ok(format!("{PLAIN_ID}\n{STOPPED}\n")),
+                )
+                // Created, and noted by another freshdock, after the listing.
+                .on(
+                    &format!("inspect {LATE}"),
+                    ok(fixture("nerdctl_netdep_inspect.json")),
+                )
+                .on(&format!("inspect {GONE}"), fail(NOT_FOUND)),
+        );
+        seen_running_old(&n, &[STOPPED, LATE, GONE]);
+        n.list_running().await.unwrap();
+        assert!(
+            n.seen.get(STOPPED).is_some(),
+            "a stopped container keeps its note: started again, it runs the same image"
+        );
+        assert!(n.seen.get(LATE).is_some(), "checked again, and still there");
+        assert_eq!(n.seen.get(GONE), None, "removed, so forgotten");
+        assert!(
+            !n.runner.calls().contains(&format!("inspect {STOPPED}")),
+            "only what the listing misses is checked by itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_full_listing_no_note_is_forgotten() {
+        let n = nerdctl(tag_moved().on("ps -a --no-trunc -q", fail("connection refused")));
+        seen_running_old(&n, &[NETDEP_ID]);
+        n.list_running().await.unwrap();
+        assert!(n.seen.get(NETDEP_ID).is_some());
+    }
+
+    #[tokio::test]
     async fn a_container_freshdock_creates_from_its_tag_is_noted() {
         // So its first listing needn't tell its image from its filesystem.
         let n =
@@ -3202,11 +3288,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn containers_no_longer_listed_are_forgotten() {
+    async fn containers_that_are_gone_are_forgotten() {
         let n = nerdctl(
             tag_moves_after_first_listing()
                 .on_once("ps --no-trunc -q", ok(format!("{PLAIN_ID}\n")))
-                .on_once("ps --no-trunc -q", ok("")),
+                .on_once("ps --no-trunc -q", ok(""))
+                // Removed: in no listing, and not found by itself.
+                .on("ps -a --no-trunc -q", ok(""))
+                .on_once(
+                    &format!("inspect {PLAIN_ID}"),
+                    ok(fixture("nerdctl_plain_inspect.json")),
+                )
+                .on_once(&format!("inspect {PLAIN_ID}"), fail(NOT_FOUND)),
         );
         n.list_running().await.unwrap();
         assert_eq!(n.seen.len(), 1);
