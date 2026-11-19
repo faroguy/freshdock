@@ -1774,8 +1774,12 @@ impl<R: CommandRunner> DockerOps for Nerdctl<R> {
         refuse_unsupported(name, nerdctl)?;
         // Created from its tag: freshdock knows which image that is, so the
         // new container's first listing needn't tell it from its filesystem,
-        // which images sharing its layers can leave ambiguous. Noted only if
-        // the tag named the same image before and after the create.
+        // which images sharing its layers can leave ambiguous. nerdctl
+        // doesn't say which image it resolved the tag to, so the note needs
+        // evidence: the tag named the same image before and after the
+        // create, and the new container's filesystem sits on that image.
+        // The one case this can't catch: the tag moved away and back during
+        // the create, to an image with the same layers.
         let from_tag = image == spec.image_ref && !image.contains('@');
         let before = match from_tag {
             true => self.try_identify(image).await,
@@ -1785,7 +1789,16 @@ impl<R: CommandRunner> DockerOps for Nerdctl<R> {
         if let Some(before) = before.filter(|b| b.id.is_some())
             && self.try_identify(image).await.as_ref() == Some(&before)
         {
-            self.seen.insert(&id, before);
+            match self.configs_under(&id).await {
+                Ok(Some(configs)) if before.id.as_ref().is_some_and(|c| configs.contains(c)) => {
+                    self.seen.insert(&id, before);
+                }
+                // Nothing to go by: its first listing couldn't check either.
+                Ok(None) => self.seen.insert(&id, before),
+                found => {
+                    debug!(container = %name, ?found, "the new container's filesystem doesn't show the image its tag names; leaving its image to its first listing");
+                }
+            }
         }
         Ok(id)
     }
@@ -3442,6 +3455,36 @@ mod tests {
             n.seen.get("newid").and_then(|s| s.pinned),
             Some(IMAGE_ID.to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn a_created_container_is_noted_only_if_its_filesystem_agrees() {
+        // The tag may have moved away and back during the create (#115
+        // review): the new container's filesystem has the last word.
+        const FIXTURE_CONFIG: &str =
+            "sha256:6769dc3a703c719c1d2756bda113659be28ae16cf0da58dd5fd823d6b9a050ea";
+        for (on, noted) in [(FIXTURE_CONFIG, true), ("sha256:other", false)] {
+            let mut n = nerdctl(
+                inspectable("fd-full", "full").on("create --name fd-full *", ok("newid\n")),
+            );
+            n.ctr = Some(
+                FakeRunner::default()
+                    .on(
+                        "containers info newid",
+                        ok(r#"{"Snapshotter":"overlayfs","SnapshotKey":"k9"}"#),
+                    )
+                    .on(
+                        "snapshots --snapshotter overlayfs info k9",
+                        ok(r#"{"Parent":"sha256:top"}"#),
+                    )
+                    .on("content ls -q *", ok(format!("{on}\n")))
+                    .on("content get sha256:*", ok(fixture_image_config()))
+                    .on("*", fail("ctr is not available")),
+            );
+            let spec = n.inspect("fd-full").await.unwrap();
+            n.create_from_spec("fd-full", &spec, IMAGE).await.unwrap();
+            assert_eq!(n.seen.get("newid").is_some(), noted, "filesystem on {on}");
+        }
     }
 
     #[tokio::test]

@@ -269,8 +269,11 @@ logs both.
   variable or label the container lacks, can't be its image. If the ones left
   give their containers the same settings, it makes no difference which it
   runs; if they differ, freshdock warns and leaves the container alone as
-  above. A container freshdock itself creates from its tag is noted at once, so
-  this never applies to it.
+  above. A container freshdock itself creates from its tag is noted at once, when
+  the tag names the same image before and after the create and the new
+  container's filesystem sits on it, so this doesn't apply to it. (Only a tag
+  moved away and back by something else during that one create, to an image
+  with the same layers, could make that note wrong.)
 
   `freshdock check` reads the same notes, and tells a container it has no note
   for from its filesystem in the same way, so it reports each container by the
