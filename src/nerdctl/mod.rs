@@ -504,22 +504,18 @@ impl<R: CommandRunner> Nerdctl<R> {
             .map(|(id, _)| id.get(..12).unwrap_or(id).to_owned())
     }
 
-    /// Is there an image record named exactly `reference` (a digest
-    /// reference)? `nerdctl image inspect` can't answer this: it fails on a
-    /// digest reference even when such a record exists. Spellings of one
-    /// repository (`library/nginx`, `docker.io/library/nginx`) count as the
-    /// same.
-    async fn has_record(&self, reference: &str) -> Result<bool, DockerError> {
-        let Some((repo, digest)) = reference.rsplit_once('@') else {
-            return Ok(false);
-        };
-        let want = crate::registry::familiar_repository(repo);
-        let names = self.call(&["images", "--format", "{{.Name}}"]).await?;
-        Ok(names.lines().map(str::trim).any(|name| {
-            name.rsplit_once('@').is_some_and(|(r, d)| {
-                d == digest && crate::registry::familiar_repository(r) == want
-            })
-        }))
+    /// The image record named exactly `reference` (a digest reference), and
+    /// whether it points at the digest its name says. `nerdctl image inspect`
+    /// can't answer this: it fails on a digest reference even when such a
+    /// record exists. A record's name is not proof of its target: `nerdctl
+    /// tag` names whatever its source points at, so a source that moved
+    /// leaves a digest name on the wrong image.
+    async fn record_state(&self, reference: &str) -> Result<Record, DockerError> {
+        Ok(match self.record_digest(reference).await? {
+            None => Record::Missing,
+            Some(target) if Some(target.as_str()) == digest_of(reference) => Record::Good,
+            Some(target) => Record::Wrong(target),
+        })
     }
 
     /// Keep the image `tag` points at findable after a pull moves the tag.
@@ -553,9 +549,13 @@ impl<R: CommandRunner> Nerdctl<R> {
             debug!(image = %pinned, "no listed container runs the current image; nothing to keep");
             return None;
         }
-        match self.has_record(&pinned).await {
-            Ok(false) => {}
-            Ok(true) => return None,
+        match self.record_state(&pinned).await {
+            Ok(Record::Missing) => {}
+            Ok(Record::Good) => return None,
+            Ok(Record::Wrong(target)) => {
+                warn!(image = %pinned, %target, "a record named after the current image points at another one; not keeping it, so a sibling on the same tag may be refused its update");
+                return None;
+            }
             Err(e) => {
                 warn!(image = %pinned, error = %e, "could not check for the current image before the pull");
                 return None;
@@ -586,8 +586,23 @@ impl<R: CommandRunner> Nerdctl<R> {
     /// freshdock has made that record (see [`name_by_digest`](Self::name_by_digest)).
     /// Otherwise the image is gone, and the create is refused.
     async fn local_image(&self, image: &str, tag: &str) -> Result<String, DockerError> {
-        if image == tag || !image.contains('@') || self.has_record(image).await? {
+        if image == tag || !image.contains('@') {
             return Ok(image.to_owned());
+        }
+        match self.record_state(image).await? {
+            Record::Good => return Ok(image.to_owned()),
+            Record::Missing => {}
+            // Never created from, whoever made it. One of freshdock's own
+            // (left by a removal that failed, say) is removed again.
+            Record::Wrong(target) => {
+                if self.kept.names().contains(image) {
+                    self.release(image).await;
+                }
+                return Err(DockerError::Unsupported(format!(
+                    "the image record {image} points at {target}, not at the image its name \
+                     says, so freshdock won't create a container from it"
+                )));
+            }
         }
         let now = self.identify(tag).await.pinned;
         if now.as_deref().and_then(digest_of).is_some()
@@ -647,8 +662,8 @@ impl<R: CommandRunner> Nerdctl<R> {
     }
 
     /// The digest the image record named exactly `reference` points at, or
-    /// `None` when there is no such record. Spellings of one repository count
-    /// as the same, as in [`has_record`](Self::has_record).
+    /// `None` when there is no such record. Spellings of one repository
+    /// (`library/nginx`, `docker.io/library/nginx`) count as the same.
     async fn record_digest(&self, reference: &str) -> Result<Option<String>, DockerError> {
         let Some((repo, digest)) = reference.rsplit_once('@') else {
             return Ok(None);
@@ -1209,7 +1224,22 @@ impl<R: CommandRunner> Nerdctl<R> {
         dependent: &str,
         spec: &ContainerSpec,
     ) -> Result<Option<String>, DockerError> {
-        // A digest reference names fixed bits, and the repair keeps it.
+        // A digest reference names fixed bits, and the repair creates from it
+        // as it is: only a record under that exact name, pointing at those
+        // bits, will do.
+        if spec.image_ref.contains('@') {
+            return Ok(match self.record_state(&spec.image_ref).await? {
+                Record::Good => None,
+                Record::Missing => Some(format!(
+                    "the image it runs, {}, is no longer available locally",
+                    spec.image_ref
+                )),
+                Record::Wrong(target) => Some(format!(
+                    "the image record it runs from, {}, now points at {target}",
+                    spec.image_ref
+                )),
+            });
+        }
         if crate::probe::is_pinned(&spec.image_ref) {
             return Ok(None);
         }
@@ -1245,7 +1275,7 @@ impl<R: CommandRunner> Nerdctl<R> {
                 let on_tag = now.pinned.as_deref().and_then(digest_of).is_some()
                     && now.pinned.as_deref().and_then(digest_of) == digest_of(pinned);
                 let local = on_tag
-                    || self.has_record(pinned).await?
+                    || self.record_state(pinned).await? == Record::Good
                     || self.other_name_of(pinned).await.is_some();
                 (!local)
                     .then(|| format!("the image it runs, {pinned}, is no longer available locally"))
@@ -1808,6 +1838,17 @@ impl<R: CommandRunner> DockerOps for Nerdctl<R> {
     }
 }
 
+/// What [`Nerdctl::record_state`] finds under a digest name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Record {
+    /// No record has that name.
+    Missing,
+    /// It points at the digest its name says.
+    Good,
+    /// It points at this other digest.
+    Wrong(String),
+}
+
 /// The `sha256:...` part of a digest reference (`repo@sha256:...`), which is
 /// how two spellings of one image record compare equal
 /// (`library/nginx@...` and `docker.io/library/nginx@...`).
@@ -2359,8 +2400,10 @@ mod tests {
                 ok(image_json("sha256:old", OLD_DIGEST)),
             )
             .on(
-                "images --format {{.Name}}",
-                ok(format!("docker.io/library/nginx@{OLD_DIGEST}\n{IMAGE}\n")),
+                "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                ok(format!(
+                    "docker.io/library/nginx@{OLD_DIGEST}\t{OLD_DIGEST}\n{IMAGE}\t{NEW_DIGEST}\n"
+                )),
             )
     }
 
@@ -2384,8 +2427,8 @@ mod tests {
                 ok(image_json("sha256:old", OLD_DIGEST)),
             )
             .on(
-                "images --format {{.Name}}",
-                ok("docker.io/library/nginx:alpine\n"),
+                "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                ok(format!("docker.io/library/nginx:alpine\t{OLD_DIGEST}\n")),
             )
             .on(
                 &format!("tag library/nginx:alpine library/nginx@{OLD_DIGEST}"),
@@ -2409,13 +2452,15 @@ mod tests {
                     ok(image_json("sha256:old", OLD_DIGEST)),
                 )
                 .on_once(
-                    "images --format {{.Name}}",
-                    ok("docker.io/library/nginx:alpine\n"),
+                    "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                    ok(format!("docker.io/library/nginx:alpine\t{OLD_DIGEST}\n")),
                 )
                 // Once kept, containerd lists the old image under it.
                 .on(
-                    "images --format {{.Name}}",
-                    ok(format!("docker.io/library/nginx:alpine\n{kept}\n")),
+                    "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                    ok(format!(
+                        "docker.io/library/nginx:alpine\t{NEW_DIGEST}\n{kept}\t{OLD_DIGEST}\n"
+                    )),
                 )
                 .on(&format!("tag library/nginx:alpine {kept}"), ok(""))
                 .on("pull --quiet library/nginx:alpine", ok(""))
@@ -2495,9 +2540,8 @@ mod tests {
                     ok(image_json("sha256:old", OLD_DIGEST)),
                 )
                 .on(
-                    "images --format {{.Name}}",
-                    ok("docker.io/library/nginx:alpine
-"),
+                    "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                    ok(format!("docker.io/library/nginx:alpine\t{OLD_DIGEST}\n")),
                 )
                 .on(
                     &format!("tag library/nginx:alpine library/nginx@{OLD_DIGEST}"),
@@ -2525,9 +2569,10 @@ mod tests {
                     ok(image_json("sha256:old", OLD_DIGEST)),
                 )
                 .on(
-                    "images --format {{.Name}}",
+                    "images --no-trunc --format {{.Name}}\t{{.Digest}}",
                     ok(format!(
-                        "docker.io/library/nginx@{OLD_DIGEST}\ndocker.io/library/nginx:alpine\n"
+                        "docker.io/library/nginx@{OLD_DIGEST}\t{OLD_DIGEST}\n\
+                         docker.io/library/nginx:alpine\t{OLD_DIGEST}\n"
                     )),
                 )
                 .on("pull --quiet library/nginx:alpine", ok("")),
@@ -2542,7 +2587,10 @@ mod tests {
         let pinned = format!("docker.io/library/nginx@{OLD_DIGEST}");
         let n = nerdctl(
             FakeRunner::default()
-                .on("images --format {{.Name}}", ok(format!("{IMAGE}\n")))
+                .on(
+                    "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                    ok(format!("{IMAGE}\t{OLD_DIGEST}\n")),
+                )
                 .on(
                     &format!("image inspect {IMAGE}"),
                     ok(image_json("sha256:old", OLD_DIGEST)),
@@ -2559,10 +2607,38 @@ mod tests {
     #[tokio::test]
     async fn an_existing_digest_record_is_used_as_it_is() {
         let pinned = format!("docker.io/library/nginx@{OLD_DIGEST}");
-        let n = nerdctl(
-            FakeRunner::default().on("images --format {{.Name}}", ok(format!("{pinned}\n"))),
-        );
+        let n = nerdctl(FakeRunner::default().on(
+            "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+            ok(format!("{pinned}\t{OLD_DIGEST}\n")),
+        ));
         assert_eq!(n.local_image(&pinned, IMAGE).await.unwrap(), pinned);
+    }
+
+    #[tokio::test]
+    async fn a_digest_record_on_the_wrong_image_is_never_used() {
+        // Left by a tag whose source moved, and whose removal then failed
+        // (#115 review): its name says the old image, it points at the new.
+        let pinned = format!("docker.io/library/nginx@{OLD_DIGEST}");
+        let n = nerdctl(
+            FakeRunner::default()
+                .on(
+                    "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                    ok(format!("{pinned}\t{NEW_DIGEST}\n")),
+                )
+                .on_once(&format!("rmi {pinned}"), fail("containerd is restarting"))
+                .on(&format!("rmi {pinned}"), ok("")),
+        );
+        n.kept.insert(&pinned);
+        for attempt in ["the removal fails", "and on the next try"] {
+            let err = n.local_image(&pinned, IMAGE).await.unwrap_err();
+            assert!(
+                matches!(err, DockerError::Unsupported(_)),
+                "{attempt}: {err}"
+            );
+            assert!(err.to_string().contains(NEW_DIGEST), "{attempt}: {err}");
+        }
+        assert!(n.kept.names().is_empty(), "removed on the second try");
+        assert!(!n.runner.calls().iter().any(|c| c.starts_with("create ")));
     }
 
     #[tokio::test]
@@ -2570,7 +2646,6 @@ mod tests {
         let pinned = format!("docker.io/library/nginx@{OLD_DIGEST}");
         let n = nerdctl(
             FakeRunner::default()
-                .on("images --format {{.Name}}", ok(format!("{IMAGE}\n")))
                 // The tag has moved on: nothing local is that image any more.
                 .on(
                     &format!("image inspect {IMAGE}"),
@@ -2603,18 +2678,23 @@ mod tests {
     /// has tried to name it by its digest.
     fn only_another_name_left(after: String) -> FakeRunner {
         let pinned = format!("docker.io/library/nginx@{OLD_DIGEST}");
+        let before = format!(
+            "{IMAGE}\t{NEW_DIGEST}\n\
+             docker.io/library/nginx:keep\t{OLD_DIGEST}\n"
+        );
         FakeRunner::default()
-            .on("images --format {{.Name}}", ok(format!("{IMAGE}\n")))
             .on(
                 &format!("image inspect {IMAGE}"),
                 ok(image_json("sha256:new", NEW_DIGEST)),
             )
+            // Read for a record under the digest name, then for another name.
             .on_once(
                 "images --no-trunc --format {{.Name}}\t{{.Digest}}",
-                ok(format!(
-                    "{IMAGE}\t{NEW_DIGEST}\n\
-                     docker.io/library/nginx:keep\t{OLD_DIGEST}\n"
-                )),
+                ok(before.clone()),
+            )
+            .on_once(
+                "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                ok(before),
             )
             .on(
                 &format!("tag docker.io/library/nginx:keep {pinned}"),
@@ -2677,7 +2757,6 @@ mod tests {
                     &format!("tag docker.io/library/nginx:keep {pinned}"),
                     fail("containerd is restarting"),
                 )
-                .on("images --format {{.Name}}", ok(format!("{IMAGE}\n")))
                 .on(
                     &format!("image inspect {IMAGE}"),
                     ok(image_json("sha256:new", NEW_DIGEST)),
@@ -4130,15 +4209,10 @@ mod tests {
                 id: Some("sha256:old".to_owned()),
                 pinned: Some(gone.clone()),
             },
-            owner_with_dependent(serde_json::json!(["PATH=/bin"]))
-                .on(
-                    "images --format {{.Name}}",
-                    ok("docker.io/library/alpine:3.20\n"),
-                )
-                .on(
-                    "images --no-trunc --format {{.Name}}\t{{.Digest}}",
-                    ok(format!("docker.io/library/alpine:3.20\t{NEW_DIGEST}\n")),
-                ),
+            owner_with_dependent(serde_json::json!(["PATH=/bin"])).on(
+                "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                ok(format!("docker.io/library/alpine:3.20\t{NEW_DIGEST}\n")),
+            ),
         )
         .await
         .unwrap_err();
@@ -4147,6 +4221,46 @@ mod tests {
             msg.contains(&format!("{gone}, is no longer available")),
             "{msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_owner_is_not_updated_when_its_pinned_dependents_record_is_gone() {
+        // The dependent runs from a digest reference, whose record someone
+        // removed: its repair would create from that exact name, and fail
+        // only after the owner's stop (#115 review).
+        let pinned = format!("docker.io/library/alpine@{OLD_DIGEST}");
+        let mut netdep: Vec<serde_json::Value> =
+            serde_json::from_str(&fixture("nerdctl_netdep_inspect.json")).unwrap();
+        netdep[0]["Config"]["Env"] = serde_json::json!(["PATH=/bin"]);
+        netdep[0]["Config"]["Image"] = serde_json::Value::from(pinned.clone());
+        let listing = |records: &str| {
+            owner_with_dependent(serde_json::json!(["PATH=/bin"]))
+                .on_once(
+                    "inspect fd-netdep",
+                    ok(serde_json::to_string(&netdep).unwrap()),
+                )
+                .on(
+                    "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                    ok(records.to_owned()),
+                )
+        };
+        let err = dependent_check(
+            Seen::default(),
+            listing("docker.io/library/alpine:3.20\tsha256:x\n"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("{pinned}, is no longer available")),
+            "{err}"
+        );
+        dependent_check(
+            Seen::default(),
+            listing(&format!("{pinned}\t{OLD_DIGEST}\n")),
+        )
+        .await
+        .expect("its record is there, so its repair can be made");
     }
 
     #[tokio::test]
