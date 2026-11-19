@@ -560,6 +560,65 @@ async fn an_owner_whose_dependent_cannot_be_recreated_is_left_alone() {
 
 #[tokio::test]
 #[ignore = "needs rootful nerdctl; set FRESHDOCK_NERDCTL_LIVE=1"]
+async fn an_owner_whose_dependents_image_is_gone_is_left_alone() {
+    // The dependent's tag moved before freshdock saw it, and the image it
+    // runs has no name left. Its repair after the owner's update could only
+    // fall back to the tag, moving it to the new image with no health gate,
+    // so the owner is refused up front (#115 review).
+    let Some(n) = backend().await else { return };
+    let p = prefix("nsgone");
+    let tag = "127.0.0.1:15005/freshdock-live/depgone:v";
+    let _images = ImageTeardown(tag);
+    let _teardown = Teardown {
+        prefix: p.clone(),
+        networks: vec![],
+    };
+    #[rustfmt::skip]
+    must(&[
+        "run", "-d", "--name", &format!("{p}-registry"), "-p", "127.0.0.1:15005:5000",
+        "docker.io/library/registry:2",
+    ]);
+    let version = |v: &str| {
+        format!("FROM {ALPINE}\nRUN echo depgone {v} > /version\nCMD [\"sleep\", \"100000\"]\n")
+    };
+    build_and_publish(&version("v1"), tag);
+    must(&["pull", "--quiet", tag]);
+    let owner = format!("{p}-vpn");
+    let dependent = format!("{p}-app");
+    #[rustfmt::skip]
+    must(&[
+        "run", "-d", "--name", &owner, "--label", "freshdock.enable=true",
+        ALPINE, "sleep", "100000",
+    ]);
+    #[rustfmt::skip]
+    must(&[
+        "run", "-d", "--name", &dependent, "--network", &format!("container:{owner}"), tag,
+    ]);
+    build_and_publish(&version("v2"), tag);
+    must(&["pull", "--quiet", tag]);
+    let owner_before = id_of(&owner).unwrap();
+    let dependent_before = id_of(&dependent).unwrap();
+
+    let err = recreate(&n, &owner)
+        .await
+        .expect_err("refused at preflight");
+    let msg = err.to_string();
+    assert!(msg.contains(&dependent), "{msg}");
+    assert!(msg.contains("was not updated"), "{msg}");
+    assert_eq!(id_of(&owner).as_deref(), Some(owner_before.as_str()));
+    assert_eq!(
+        id_of(&dependent).as_deref(),
+        Some(dependent_before.as_str()),
+        "not moved to v2"
+    );
+    assert!(
+        running(&owner) && running(&dependent),
+        "nothing was stopped"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs rootful nerdctl; set FRESHDOCK_NERDCTL_LIVE=1"]
 async fn a_setting_that_cannot_be_reproduced_is_refused_before_the_stop() {
     let Some(n) = backend().await else { return };
     let p = prefix("ip");

@@ -968,8 +968,73 @@ impl<R: CommandRunner> Nerdctl<R> {
                     unsupported.join("; ")
                 )));
             }
+            if let Some(why) = self.repair_source_missing(&dependent, &spec).await? {
+                return Err(DockerError::Unsupported(format!(
+                    "{owner} shares its network namespace with {dependent}, which would have to \
+                     be re-created after the update, but {why}, so {owner} was not updated. It \
+                     is tried again on the next pass"
+                )));
+            }
         }
         Ok(())
+    }
+
+    /// Why `dependent`'s repair could not re-create it from the image it
+    /// runs, if it couldn't. The repair (`repair_image`) uses the tag while
+    /// the tag still names that image, else the image's digest reference;
+    /// knowing neither, it falls back to the tag, which would quietly move the
+    /// dependent to whatever the tag names now, with no health gate.
+    ///
+    /// An image whose config can't be read is no obstacle: the repair carries
+    /// every setting over, which is right for the same image.
+    async fn repair_source_missing(
+        &self,
+        dependent: &str,
+        spec: &ContainerSpec,
+    ) -> Result<Option<String>, DockerError> {
+        // A digest reference names fixed bits, and the repair keeps it.
+        if crate::probe::is_pinned(&spec.image_ref) {
+            return Ok(None);
+        }
+        let seen = match self.inspect_container(dependent).await?.id.as_deref() {
+            Some(cid) => self.image_of(cid, &spec.image_ref).await,
+            None => Seen::default(),
+        };
+        let Some(now) = self.try_identify(&spec.image_ref).await else {
+            return Ok(Some(format!(
+                "its tag {} could not be looked up",
+                spec.image_ref
+            )));
+        };
+        let missing = match (&seen.id, &seen.pinned) {
+            (None, None) if now == Seen::default() => Some(format!(
+                "its tag {} names no local image, and freshdock only creates containers from \
+                 local images",
+                spec.image_ref
+            )),
+            (None, None) => Some(format!(
+                "freshdock can't tell which image it runs, and its tag {} may name another one now",
+                spec.image_ref
+            )),
+            // Known by its config only: the tag is usable only while it names it.
+            (Some(id), None) => (now.id.as_ref() != Some(id)).then(|| {
+                format!(
+                    "the image it runs has no name freshdock can create it from, and its tag {} \
+                     names another one now",
+                    spec.image_ref
+                )
+            }),
+            (_, Some(pinned)) => {
+                let on_tag = now.pinned.as_deref().and_then(digest_of).is_some()
+                    && now.pinned.as_deref().and_then(digest_of) == digest_of(pinned);
+                let local = on_tag
+                    || self.has_record(pinned).await?
+                    || self.other_name_of(pinned).await.is_some();
+                (!local)
+                    .then(|| format!("the image it runs, {pinned}, is no longer available locally"))
+            }
+        };
+        Ok(missing)
     }
 
     /// Where the trial container's runtime spec and labels differ from the
@@ -3553,6 +3618,92 @@ mod tests {
         let spec = n.inspect("fd-plain").await.unwrap();
         n.preflight_recreate(&spec).await.unwrap();
         assert!(n.runner.calls().contains(&"inspect fd-netdep".to_owned()));
+    }
+
+    /// An owner's update with fd-netdep first seen running `seen`, the
+    /// dependent's checks only: what the owner's own preflight would do next
+    /// is beside the point.
+    async fn dependent_check(seen: Seen, runner: FakeRunner) -> Result<(), DockerError> {
+        let n = nerdctl(runner);
+        n.seen.insert(NETDEP_ID, seen);
+        n.refuse_unreproducible_dependents("fd-plain").await
+    }
+
+    #[tokio::test]
+    async fn an_owner_is_not_updated_when_its_dependents_image_is_unknown() {
+        // The dependent's tag moved before freshdock saw it, and its
+        // filesystem no longer tells its image (#115 review): a repair would
+        // fall back to the tag and move it to the new image, unchecked.
+        let err = dependent_check(
+            Seen::default(),
+            owner_with_dependent(serde_json::json!(["PATH=/bin"])),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DockerError::Unsupported(_)), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("fd-netdep"), "{msg}");
+        assert!(msg.contains("can't tell which image it runs"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn an_owner_is_not_updated_when_its_dependents_image_is_gone() {
+        let gone = format!("docker.io/library/alpine@{OLD_DIGEST}");
+        let err = dependent_check(
+            Seen {
+                id: Some("sha256:old".to_owned()),
+                pinned: Some(gone.clone()),
+            },
+            owner_with_dependent(serde_json::json!(["PATH=/bin"]))
+                .on(
+                    "images --format {{.Name}}",
+                    ok("docker.io/library/alpine:3.20\n"),
+                )
+                .on(
+                    "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                    ok(format!("docker.io/library/alpine:3.20\t{NEW_DIGEST}\n")),
+                ),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("{gone}, is no longer available")),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_owner_is_not_updated_when_its_dependents_tag_names_no_local_image() {
+        let err = dependent_check(
+            Seen::default(),
+            owner_with_dependent(serde_json::json!(["PATH=/bin"])).on_once(
+                "image inspect docker.io/library/alpine:3.20",
+                fail(NOT_FOUND),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("names no local image"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_dependent_whose_image_config_cant_be_read_is_still_repairable() {
+        // The image is known, and still its tag's: the repair re-creates it
+        // from the same image, carrying everything over.
+        let mut n = nerdctl(owner_with_dependent(serde_json::json!(["PATH=/bin"])));
+        n.ctr = None;
+        n.refuse_unreproducible_dependents("fd-plain")
+            .await
+            .unwrap();
+        assert!(
+            n.inspect("fd-netdep")
+                .await
+                .unwrap()
+                .nerdctl()
+                .unwrap()
+                .image_config_unknown
+        );
     }
 
     #[tokio::test]
