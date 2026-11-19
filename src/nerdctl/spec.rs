@@ -147,6 +147,26 @@ impl ImageConfig {
         }
         Some(config)
     }
+
+    /// Could a container whose (merged) environment is `env` and labels are
+    /// `labels` have been created from this image? A container can override
+    /// an image's variable or label, but not drop it, so one the image sets
+    /// that the container lacks rules the image out. Every other setting can
+    /// be overridden, so it proves nothing.
+    pub fn fits(&self, env: &[String], labels: &HashMap<String, String>) -> bool {
+        let key = |e: &str| e.split_once('=').map_or(e, |(k, _)| k).to_owned();
+        let container_keys: std::collections::HashSet<String> =
+            env.iter().map(|e| key(e)).collect();
+        self.env
+            .iter()
+            .flatten()
+            .all(|e| container_keys.contains(&key(e)))
+            && self
+                .labels
+                .iter()
+                .flatten()
+                .all(|(k, _)| labels.contains_key(k))
+    }
 }
 
 /// What nerdctl uses for a healthcheck timing the image leaves unset, and

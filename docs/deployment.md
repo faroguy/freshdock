@@ -259,11 +259,16 @@ logs both.
   was installed, say) is caught from the container's filesystem, which sits on
   its image's layers (read with `ctr`): if that image still has a name, freshdock
   updates the container from it as usual. If it has none left (containerd then
-  removes it), or other images share its layers, freshdock can't tell which image
-  the container runs. It warns once and leaves the container alone until you
-  re-create it from its tag. Only an image with exactly the same layers as the
-  tag's (a rebuild that changed nothing but `ENV` or labels) passes for the
-  tag's.
+  removes it), freshdock can't tell which image the container runs. It warns
+  once and leaves the container alone until you re-create it from its tag.
+  Images with exactly the same layers (a rebuild that changed nothing but `ENV`
+  or labels, or an image that adds no layers to its base) are told apart: an
+  image only other repositories name, or one that sets a variable or label the
+  container lacks, can't be its image. If the ones left
+  give their containers the same settings, it makes no difference which it
+  runs; if they differ, freshdock warns and leaves the container alone as
+  above. A container freshdock itself creates from its tag is noted at once, so
+  this never applies to it.
 
   `freshdock check` is a new process every time, so to it every tag that moved
   is one that moved before it first looked. After the daemon updates one
