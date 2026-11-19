@@ -3159,6 +3159,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_kept_image_a_stopped_container_needs_survives_a_restart() {
+        // fd-netdep was noted on the old image, which freshdock kept by its
+        // digest when the tag moved; then freshdock restarted while fd-netdep
+        // was stopped (#115 review).
+        const STOPPED: &str = NETDEP_ID;
+        let kept = format!("docker.io/library/nginx@{OLD_DIGEST}");
+        let dir = private::PrivateDir::new("kept-stopped").unwrap();
+        let file = dir.path().join("seen");
+        SeenStore::persistent(NS, &file).insert(
+            STOPPED,
+            Seen {
+                id: Some("sha256:old".to_owned()),
+                pinned: Some(kept.clone()),
+            },
+        );
+        let mut n = nerdctl(
+            tag_moved()
+                .on_once(
+                    "ps -a --no-trunc -q",
+                    ok(format!("{PLAIN_ID}\n{STOPPED}\n")),
+                )
+                // Then it is removed.
+                .on("ps -a --no-trunc -q", ok(format!("{PLAIN_ID}\n")))
+                .on(&format!("inspect {STOPPED}"), fail(NOT_FOUND))
+                .on(&format!("rmi {kept}"), ok("")),
+        );
+        n.seen = SeenStore::persistent(NS, &file);
+        n.kept.insert(&kept);
+        n.housekeeping
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        n.list_running().await.unwrap();
+        assert!(
+            !n.runner.calls().contains(&format!("rmi {kept}")),
+            "still needed by the stopped container"
+        );
+        n.list_running().await.unwrap();
+        assert!(
+            n.runner.calls().contains(&format!("rmi {kept}")),
+            "released once the container is gone"
+        );
+        assert!(n.kept.names().is_empty());
+    }
+
+    #[tokio::test]
     async fn without_a_full_listing_no_note_is_forgotten() {
         let n = nerdctl(tag_moved().on("ps -a --no-trunc -q", fail("connection refused")));
         seen_running_old(&n, &[NETDEP_ID]);

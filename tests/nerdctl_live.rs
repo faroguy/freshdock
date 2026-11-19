@@ -1255,6 +1255,20 @@ async fn a_stopped_container_keeps_its_image_note() {
         .expect("pull v2");
     must(&["stop", &name]);
     n.list_running().await.unwrap();
+    drop(n);
+    // freshdock restarts while the container is stopped, and its first pass
+    // must not release the name v1 was kept under: the stopped container
+    // still needs it, and only the note on disk says so.
+    let n = backend().await.unwrap();
+    n.sweep_or_warn().await;
+    n.list_running().await.unwrap();
+    assert!(
+        digest_records()
+            .iter()
+            .any(|r| r.starts_with("127.0.0.1:15006/freshdock-live/stopped@")),
+        "v1 is still kept: {:?}",
+        digest_records()
+    );
     must(&["start", &name]);
 
     let outcome = recreate(&n, &name).await.expect("recreate");

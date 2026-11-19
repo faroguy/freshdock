@@ -155,19 +155,29 @@ impl SeenStore {
         });
     }
 
-    /// The images of the containers this process has looked at.
-    pub fn values(&self) -> Vec<Seen> {
-        self.memory.lock().unwrap().values().cloned().collect()
+    /// The images of every noted container, with its id: this process's
+    /// notes, and those in the file, which also cover containers this
+    /// process hasn't looked at (a stopped one after a restart, or one
+    /// another freshdock process noted). This process's note wins where
+    /// both have one. What decides which images are still needed.
+    pub fn entries(&self) -> Vec<(String, Seen)> {
+        let mut all: HashMap<String, Seen> = HashMap::new();
+        self.change_file(|entries| {
+            all.extend(entries.iter().filter_map(|e| Seen::parse(e)));
+        });
+        all.extend(
+            self.memory
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(c, s)| (c.clone(), s.clone())),
+        );
+        all.into_iter().collect()
     }
 
-    /// The same, with each container's id.
-    pub fn entries(&self) -> Vec<(String, Seen)> {
-        self.memory
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(c, s)| (c.clone(), s.clone()))
-            .collect()
+    /// The same, without the ids.
+    pub fn values(&self) -> Vec<Seen> {
+        self.entries().into_iter().map(|(_, s)| s).collect()
     }
 
     pub fn len(&self) -> usize {
@@ -300,6 +310,25 @@ mod tests {
         assert_eq!(store.get("c1"), Some(image(1)));
         store.forget(&["c1".to_owned()].into());
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn every_note_counts_not_only_this_processs() {
+        let dir = PrivateDir::new("seenstore").unwrap();
+        let path = dir.path().join("seen");
+        // Before a restart: a container that is stopped by now.
+        SeenStore::persistent("ns", &path).insert("stopped", image(1));
+        let after = SeenStore::persistent("ns", &path);
+        after.insert("running", image(2));
+        let mut all = after.entries();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            all,
+            [
+                ("running".to_owned(), image(2)),
+                ("stopped".to_owned(), image(1))
+            ]
+        );
     }
 
     #[test]
