@@ -1197,6 +1197,20 @@ async fn a_tag_moved_before_freshdock_saw_the_container_is_noticed() {
         !env.contains("ONLY_V1"),
         "a variable only v1 set is gone: {env}"
     );
+    assert_eq!(
+        c["Config"]["Image"].as_str(),
+        Some(told),
+        "still on its own tag, never on the name its old image was found by: {c}"
+    );
+    // The trial was created from a digest name freshdock made for v1, not
+    // from the user's tag, which is left as it was.
+    let keep = "127.0.0.1:15004/freshdock-live/told:keep";
+    assert!(
+        must(&["images", "--format", "{{.Repository}}:{{.Tag}}"])
+            .lines()
+            .any(|l| l == keep),
+        "the user's name is untouched"
+    );
 
     let lost_before = id_of(lost_name).unwrap();
     let err = recreate(&n, lost_name)

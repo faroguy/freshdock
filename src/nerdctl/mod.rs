@@ -581,8 +581,10 @@ impl<R: CommandRunner> Nerdctl<R> {
     /// The local name to create `image` (a digest reference) from without the
     /// network: the digest reference itself when containerd has a record under
     /// it, else `tag` while that still points at the same image (it is the
-    /// same bits, and naming it would leave a record to clean up). Otherwise
-    /// the image is gone, and the create is refused.
+    /// same bits, and naming it would leave a record to clean up). Else, when
+    /// some other name still points at it, the digest reference once
+    /// freshdock has made that record (see [`name_by_digest`](Self::name_by_digest)).
+    /// Otherwise the image is gone, and the create is refused.
     async fn local_image(&self, image: &str, tag: &str) -> Result<String, DockerError> {
         if image == tag || !image.contains('@') || self.has_record(image).await? {
             return Ok(image.to_owned());
@@ -595,14 +597,72 @@ impl<R: CommandRunner> Nerdctl<R> {
         }
         // Another name of the same image: a tag of the user's, say, which is
         // how an image told from a container's filesystem may be found (see
-        // `image_under`).
+        // `image_under`). That name can move at any time, so it is only used
+        // to give the image its digest name.
         if let Some(name) = self.other_name_of(image).await {
-            return Ok(name);
+            return self.name_by_digest(&name, image).await;
         }
         Err(DockerError::Unsupported(format!(
             "the image {image} is no longer available locally, and freshdock only \
              creates containers from local images"
         )))
+    }
+
+    /// Give the image `name` points at the digest name `image`, so a create
+    /// names those exact bits: `name` is someone else's and may move between
+    /// this check and the create, and a container created from it would
+    /// carry it as its image. The record is checked once made (`name` may
+    /// have moved just before), and remembered like
+    /// [`keep_current`](Self::keep_current)'s, to be removed once no
+    /// container runs the image.
+    async fn name_by_digest(&self, name: &str, image: &str) -> Result<String, DockerError> {
+        let refuse = |why: String| {
+            DockerError::Unsupported(format!(
+                "the image {image} has no name of its own left, and {why}, so freshdock \
+                 won't create a container from it"
+            ))
+        };
+        // Recorded first, as in `keep_current`: a freshdock killed in between
+        // leaves a record a release treats as done, never an orphaned name.
+        self.kept.insert(image);
+        if let Err(e) = self.call(&["tag", name, image]).await {
+            self.kept.remove(image);
+            return Err(refuse(format!("it could not be named by its digest: {e}")));
+        }
+        match self.record_digest(image).await {
+            Ok(Some(d)) if Some(d.as_str()) == digest_of(image) => {
+                debug!(%image, from = %name, "named the image by its digest to create from it");
+                Ok(image.to_owned())
+            }
+            found => {
+                // Ours, and pointing at the wrong image (or unverifiable).
+                self.release(image).await;
+                Err(refuse(match found {
+                    Ok(Some(d)) => format!("{name} moved to {d} while freshdock named it"),
+                    Ok(None) => "the name freshdock gave it did not appear".to_owned(),
+                    Err(e) => format!("the name freshdock gave it could not be checked: {e}"),
+                }))
+            }
+        }
+    }
+
+    /// The digest the image record named exactly `reference` points at, or
+    /// `None` when there is no such record. Spellings of one repository count
+    /// as the same, as in [`has_record`](Self::has_record).
+    async fn record_digest(&self, reference: &str) -> Result<Option<String>, DockerError> {
+        let Some((repo, digest)) = reference.rsplit_once('@') else {
+            return Ok(None);
+        };
+        let want = crate::registry::familiar_repository(repo);
+        let listing = self
+            .call(&["images", "--no-trunc", "--format", "{{.Name}}\t{{.Digest}}"])
+            .await?;
+        Ok(listing.lines().find_map(|line| {
+            let (name, d) = line.split_once('\t')?;
+            let (r, named) = name.trim().rsplit_once('@')?;
+            (named == digest && crate::registry::familiar_repository(r) == want)
+                .then(|| d.trim().to_owned())
+        }))
     }
 
     /// A local name, of the same repository, for the image the digest
@@ -2236,12 +2296,85 @@ mod tests {
         );
     }
 
+    /// The tag has moved on, and the old image is left with only a tag of
+    /// the user's, `nginx:keep`; `after` is the image listing once freshdock
+    /// has tried to name it by its digest.
+    fn only_another_name_left(after: String) -> FakeRunner {
+        let pinned = format!("docker.io/library/nginx@{OLD_DIGEST}");
+        FakeRunner::default()
+            .on("images --format {{.Name}}", ok(format!("{IMAGE}\n")))
+            .on(
+                &format!("image inspect {IMAGE}"),
+                ok(image_json("sha256:new", NEW_DIGEST)),
+            )
+            .on_once(
+                "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                ok(format!(
+                    "{IMAGE}\t{NEW_DIGEST}\n\
+                     docker.io/library/nginx:keep\t{OLD_DIGEST}\n"
+                )),
+            )
+            .on(
+                &format!("tag docker.io/library/nginx:keep {pinned}"),
+                ok(""),
+            )
+            .on(
+                "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                ok(after),
+            )
+            .on(&format!("rmi {pinned}"), ok(""))
+    }
+
     #[tokio::test]
-    async fn an_image_is_created_from_another_name_it_has() {
-        // The old image kept a tag of the user's when its own moved on.
+    async fn an_image_left_with_another_name_is_created_from_its_digest_name() {
+        let pinned = format!("docker.io/library/nginx@{OLD_DIGEST}");
+        let n = nerdctl(only_another_name_left(format!(
+            "{IMAGE}\t{NEW_DIGEST}\n\
+             docker.io/library/nginx:keep\t{OLD_DIGEST}\n\
+             {pinned}\t{OLD_DIGEST}\n"
+        )));
+        assert_eq!(
+            n.local_image(&pinned, IMAGE).await.unwrap(),
+            pinned,
+            "never the user's tag, which may move before the create, and would stay \
+             the container's image"
+        );
+        assert!(
+            n.kept.names().contains(&pinned),
+            "removed once no container runs it"
+        );
+        assert!(!n.runner.calls().iter().any(|c| c.starts_with("rmi ")));
+    }
+
+    #[tokio::test]
+    async fn another_name_that_moved_while_being_used_is_refused() {
+        // Someone moved `nginx:keep` to the new image just before freshdock
+        // named the old one after it: the digest name now holds the wrong bits.
+        let pinned = format!("docker.io/library/nginx@{OLD_DIGEST}");
+        let n = nerdctl(only_another_name_left(format!(
+            "{IMAGE}\t{NEW_DIGEST}\n\
+             docker.io/library/nginx:keep\t{NEW_DIGEST}\n\
+             {pinned}\t{NEW_DIGEST}\n"
+        )));
+        let err = n.local_image(&pinned, IMAGE).await.unwrap_err();
+        assert!(matches!(err, DockerError::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("moved"), "{err}");
+        assert!(
+            n.runner.calls().contains(&format!("rmi {pinned}")),
+            "the wrong record freshdock made is removed"
+        );
+        assert!(n.kept.names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn another_name_that_cannot_be_tagged_is_refused() {
         let pinned = format!("docker.io/library/nginx@{OLD_DIGEST}");
         let n = nerdctl(
             FakeRunner::default()
+                .on_once(
+                    &format!("tag docker.io/library/nginx:keep {pinned}"),
+                    fail("containerd is restarting"),
+                )
                 .on("images --format {{.Name}}", ok(format!("{IMAGE}\n")))
                 .on(
                     &format!("image inspect {IMAGE}"),
@@ -2249,16 +2382,12 @@ mod tests {
                 )
                 .on(
                     "images --no-trunc --format {{.Name}}\t{{.Digest}}",
-                    ok(format!(
-                        "{IMAGE}\t{NEW_DIGEST}\n\
-                         docker.io/library/nginx:keep\t{OLD_DIGEST}\n"
-                    )),
+                    ok(format!("docker.io/library/nginx:keep\t{OLD_DIGEST}\n")),
                 ),
         );
-        assert_eq!(
-            n.local_image(&pinned, IMAGE).await.unwrap(),
-            "docker.io/library/nginx:keep"
-        );
+        let err = n.local_image(&pinned, IMAGE).await.unwrap_err();
+        assert!(matches!(err, DockerError::Unsupported(_)), "{err}");
+        assert!(n.kept.names().is_empty());
     }
 
     #[tokio::test]
