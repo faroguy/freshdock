@@ -97,6 +97,15 @@ pub trait DockerOps: Sync {
     /// pull and the pre-update hook, and a dependent started in between has
     /// been checked by nothing.
     ///
+    /// Whether a failed final listing of the dependents must stop the update
+    /// before the owner's stop. Docker's policy is to carry on without them
+    /// (with a warning), so the default is `false`. A backend that checks the
+    /// dependents before the stop (see
+    /// [`preflight_dependents`](DockerOps::preflight_dependents)) can't check
+    /// what it couldn't list, and says `true`.
+    fn dependents_must_be_listed(&self) -> bool {
+        false
+    }
     /// Defaulted like [`preflight_recreate`](DockerOps::preflight_recreate).
     async fn preflight_dependents(
         &self,
@@ -290,6 +299,15 @@ pub async fn recreate_one(
     // dependents" and say so.
     let dependents = match ops.list_network_dependents(name).await {
         Ok(dependents) => dependents,
+        // Nothing has been stopped yet, so the update can wait for a pass
+        // whose listing works.
+        Err(e) if ops.dependents_must_be_listed() => {
+            return Err(DockerError::Runtime(format!(
+                "could not list the containers sharing {name}'s network namespace, so it was \
+                 not updated: a dependent that can't be listed can't be checked or re-attached \
+                 ({e})"
+            )));
+        }
         Err(e) => {
             warn!(container = %name, error = %e, "could not list network-namespace dependents; continuing without re-attaching any");
             Vec::new()
@@ -843,6 +861,8 @@ mod tests {
         dependent_image_ref: Option<String>,
         /// When set, `preflight_dependents` refuses (and records the call).
         refuse_dependents: bool,
+        /// What `dependents_must_be_listed` says.
+        dependents_must_be_listed: bool,
     }
 
     impl RecordingOps {
@@ -1182,6 +1202,10 @@ mod tests {
             Ok(self.dependents.clone())
         }
 
+        fn dependents_must_be_listed(&self) -> bool {
+            self.dependents_must_be_listed
+        }
+
         async fn preflight_dependents(
             &self,
             owner: &str,
@@ -1199,6 +1223,26 @@ mod tests {
                 dependents.join(", ")
             )))
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_dependent_listing_stops_the_update_where_the_backend_says_so() {
+        // #115 review: on nerdctl, a sidecar that joined during the hook and
+        // a listing that then timed out would leave it on the old namespace.
+        let ops = RecordingOps {
+            dependents_must_be_listed: true,
+            ..RecordingOps::default().with_failing_dependent_listing()
+        };
+        let err = recreate_one(&ops, "fd-smoke", &LifecycleHooks::default(), || {
+            1_700_000_000
+        })
+        .await
+        .expect_err("refused before the stop");
+        assert!(err.to_string().contains("not updated"), "{err}");
+        assert!(
+            !ops.into_calls().iter().any(|c| c.starts_with("stop")),
+            "nothing was stopped"
+        );
     }
 
     #[tokio::test]

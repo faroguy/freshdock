@@ -66,6 +66,8 @@ pub struct SeenStore {
     namespace: String,
     /// `None` once the file proved unusable, or for an in-memory store.
     file: Mutex<Option<PathBuf>>,
+    /// Whether this store was given a file, unusable now or not.
+    persistent: bool,
     memory: Mutex<HashMap<String, Seen>>,
 }
 
@@ -75,6 +77,7 @@ impl SeenStore {
         Self {
             namespace: namespace.to_owned(),
             file: Mutex::new(None),
+            persistent: false,
             memory: Mutex::new(HashMap::new()),
         }
     }
@@ -84,8 +87,18 @@ impl SeenStore {
         Self {
             namespace: namespace.to_owned(),
             file: Mutex::new(Some(path.into())),
+            persistent: true,
             memory: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Do [`entries`](Self::entries) hold every note? Not when this store
+    /// was given a file it can no longer read: notes from before a restart
+    /// (a stopped container's, say) are then out of sight, and an image one
+    /// of them needs could pass for unneeded. A store meant to live in memory
+    /// is complete as it is.
+    pub fn complete(&self) -> bool {
+        !self.persistent || self.file.lock().unwrap().is_some()
     }
 
     /// The note for `container`: this process's, or one in the file (made
@@ -329,6 +342,18 @@ mod tests {
                 ("stopped".to_owned(), image(1))
             ]
         );
+    }
+
+    #[test]
+    fn a_store_that_lost_its_file_is_not_complete() {
+        assert!(SeenStore::in_memory("ns").complete(), "never had a file");
+        let dir = PrivateDir::new("seenstore").unwrap();
+        let fine = SeenStore::persistent("ns", dir.path().join("seen"));
+        fine.insert("c1", image(1));
+        assert!(fine.complete());
+        let lost = SeenStore::persistent("ns", "/proc/definitely/not/writable/seen");
+        lost.insert("c1", image(1));
+        assert!(!lost.complete(), "notes on disk may be out of sight");
     }
 
     #[test]

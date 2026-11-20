@@ -305,7 +305,12 @@ logs both.
   files are replaced whole on every change, under a lock on a `.lock` file next
   to them, so a write that fails (a full disk, say) leaves them as they were. A
   failure only after the new file is in place (syncing its directory) is logged:
-  the change stands, but may not survive a crash.
+  the change stands, but may not survive a crash. After a write that did fail,
+  freshdock warns and keeps that list in memory for the rest of the run, even
+  once the disk has room again: restart freshdock (`systemctl restart
+  freshdock`) to write to the file again, or changes made in the meantime are
+  lost at the next restart. While the image notes can't be read, freshdock
+  releases and removes no image a container might still run.
 - **Registry credentials** from freshdock's configuration are passed to
   `nerdctl pull` through a temporary, owner-only `DOCKER_CONFIG`. Without them,
   nerdctl's own login (`nerdctl login`) is used. See

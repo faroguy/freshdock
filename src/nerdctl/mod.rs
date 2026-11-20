@@ -592,7 +592,8 @@ impl<R: CommandRunner> Nerdctl<R> {
             .iter()
             .filter(|s| s.pinned.as_deref().and_then(digest_of) == digest_of(&pinned))
             .count();
-        if runners == 0 {
+        // With notes out of sight, a stopped container may run it: keep it.
+        if runners == 0 && self.seen.complete() {
             debug!(image = %pinned, "no listed container runs the current image; nothing to keep");
             return None;
         }
@@ -822,9 +823,14 @@ impl<R: CommandRunner> Nerdctl<R> {
             );
             return;
         }
-        let needed: std::collections::HashSet<String> = self
-            .seen
-            .values()
+        let notes = self.seen.values();
+        if !self.seen.complete() {
+            debug!(
+                "the image notes file can't be read; releasing no kept image for the rest of this run"
+            );
+            return;
+        }
+        let needed: std::collections::HashSet<String> = notes
             .iter()
             .filter_map(|s| s.pinned.as_deref().and_then(digest_of).map(str::to_owned))
             .collect();
@@ -1712,6 +1718,12 @@ impl<R: CommandRunner> DockerOps for Nerdctl<R> {
         self.check_dependents(owner, dependents).await
     }
 
+    /// The dependents are checked before the stop, which a listing that
+    /// failed would skip.
+    fn dependents_must_be_listed(&self) -> bool {
+        true
+    }
+
     /// The digest reference `reference` resolves to now. A container's
     /// [`ContainerSpec::image_id`] on nerdctl is a digest reference too, not
     /// an image id (see [`Seen`]), so the two compare like for like: equal
@@ -1904,9 +1916,14 @@ impl<R: CommandRunner> DockerOps for Nerdctl<R> {
                      not be looked up"
                 )));
             }
-            let runners: Vec<String> = self
-                .seen
-                .entries()
+            let notes = self.seen.entries();
+            if !self.seen.complete() {
+                return Err(DockerError::Conflict(format!(
+                    "image {id} may still be run by a stopped container, whose note freshdock \
+                     can't read: the image notes file is unreadable"
+                )));
+            }
+            let runners: Vec<String> = notes
                 .into_iter()
                 .filter(|(_, s)| s.pinned.as_deref().and_then(digest_of) == Some(digest))
                 .map(|(cid, _)| cid)
@@ -2961,6 +2978,27 @@ mod tests {
         let err = n.remove_image(&pinned, false).await.unwrap_err();
         assert!(err.is_conflict(), "{err}");
         assert!(!n.runner.calls().iter().any(|c| c.starts_with("rmi")));
+    }
+
+    #[tokio::test]
+    async fn nothing_is_released_or_removed_while_the_notes_file_is_unreadable() {
+        // #115 review: a stopped container's note may be on disk only.
+        let old = format!("docker.io/library/nginx@{OLD_DIGEST}");
+        let mut n = nerdctl(FakeRunner::default());
+        n.seen = SeenStore::persistent(NS, "/proc/definitely/not/writable/seen");
+        n.seen.insert(PLAIN_ID, Seen::default());
+        n.kept.insert(&old);
+        n.housekeeping
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        n.release_kept_images().await;
+        assert!(n.kept.names().contains(&old), "not released");
+        let err = n.remove_image(&old, false).await.unwrap_err();
+        assert!(err.is_conflict(), "{err}");
+        assert!(
+            !n.runner.calls().iter().any(|c| c.starts_with("rmi ")),
+            "{:?}",
+            n.runner.calls()
+        );
     }
 
     #[tokio::test]
