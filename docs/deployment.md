@@ -266,7 +266,12 @@ logs both.
   or labels, or an image that adds no layers to its base) are told apart: the
   base of another candidate (its build history is where the other's begins,
   and no name of the container's repository has it), or an image that sets a
-  variable or label the container lacks, can't be its image. If the ones left
+  variable or label the container lacks, can't be its image. The history test
+  is no proof on its own: an old release that only another repository names,
+  whose successor only appended steps, looks like a base too. So whatever it
+  leaves must still fit the container's settings, and one release that differs
+  from the next only in something the container can override (its command,
+  say) can still be ruled out by it. If the ones left
   give their containers the same settings, it makes no difference which it
   runs; if they differ, freshdock warns and leaves the container alone as
   above. A container freshdock itself creates from its tag is noted at once, when

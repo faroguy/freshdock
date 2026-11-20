@@ -958,11 +958,16 @@ impl<R: CommandRunner> Nerdctl<R> {
     ) -> Result<Seen, String> {
         let short = id.get(..12).unwrap_or(id);
         let ours = self.of_repository(reference, configs).await?;
-        let configs: Vec<String> = ours.iter().map(|(c, _)| c.clone()).collect();
+        let left: Vec<String> = ours.iter().map(|(c, _)| c.clone()).collect();
+        // Whenever the filesystem showed several, the one left must also fit
+        // the container: ruling out a base by its history is no proof that
+        // what remains is the image (an old release that another repository
+        // names, whose successor only added an `ENV`, has the history of a
+        // base).
         let (mut candidates, alike) = if configs.len() > 1 {
-            self.configs_fitting(id, &configs).await?
+            self.configs_fitting(id, &left).await?
         } else {
-            (configs.clone(), true)
+            (left.clone(), true)
         };
         if alike || candidates.len() == 1 {
             if tag.id.as_ref().is_some_and(|t| candidates.contains(t)) {
@@ -1143,11 +1148,14 @@ impl<R: CommandRunner> Nerdctl<R> {
     /// those left, each with a digest reference of the repository's when it
     /// has one.
     ///
-    /// The one case this decides wrongly: an old release that only another
-    /// repository names now, where the new release only appended steps that
-    /// add no layers (a `LABEL` at the end, say). Its history is then where
-    /// the new one's begins, so it passes for the new one's base and is ruled
-    /// out, though the container may run it.
+    /// This can rule out the image a container runs: an old release that
+    /// only another repository names now, where the new release only appended
+    /// steps that add no layers. Its history is then where the new one's
+    /// begins, so it passes for the new one's base. The caller therefore
+    /// still checks that what is left fits the container (see
+    /// [`image_under`](Self::image_under)), which catches an appended `ENV`
+    /// or `LABEL`; an appended `CMD` or `WORKDIR`, which a container can
+    /// override, goes unnoticed.
     ///
     /// `Err` when the images can't be listed, or a blob can't be read for a
     /// reason that may pass. An image whose blobs containerd doesn't have is
@@ -3169,6 +3177,20 @@ mod tests {
     /// fd-plain's filesystem sits on the tag's new image and on `other`,
     /// whose config is `other_config`; `listing` is the local image list.
     fn new_image_and(other: &str, other_config: CmdOutput, listing: String) -> Nerdctl<FakeRunner> {
+        let new = config_blob(
+            &["PATH=/bin", "NGINX_VERSION=1.27.5"],
+            &["ADD rootfs", "ENV NGINX_VERSION=1.27.5", "CMD nginx"],
+        );
+        images_on_one_filesystem(new, other, other_config, listing)
+    }
+
+    /// The same, with `new_config` as the new image's config.
+    fn images_on_one_filesystem(
+        new_config: CmdOutput,
+        other: &str,
+        other_config: CmdOutput,
+        listing: String,
+    ) -> Nerdctl<FakeRunner> {
         let mut n = nerdctl(tag_moved().on("images --no-trunc --format *", ok(listing)));
         n.ctr = Some(filesystem_on(
             &format!("{other}\nsha256:new\n"),
@@ -3177,16 +3199,33 @@ mod tests {
                     &format!("content get {NEW_DIGEST}"),
                     ok(r#"{"config":{"digest":"sha256:new"}}"#),
                 )
-                .on(
-                    "content get sha256:new",
-                    config_blob(
-                        &["PATH=/bin", "NGINX_VERSION=1.27.5"],
-                        &["ADD rootfs", "ENV NGINX_VERSION=1.27.5", "CMD nginx"],
-                    ),
-                )
+                .on("content get sha256:new", new_config)
                 .on(&format!("content get {other}"), other_config),
         ));
         n
+    }
+
+    #[tokio::test]
+    async fn what_the_history_rule_leaves_must_still_fit_the_container() {
+        // #115 review: the new release only appends `ENV APP_PORT`, so the
+        // old one, kept as `backup/nginx:keep`, has the history of its base
+        // and is ruled out. The container lacks APP_PORT, so it can't run the
+        // new one either: it can't be told, rather than taken for the new.
+        let steps = ["ADD rootfs", "ENV NGINX_VERSION=1.27.5"];
+        let n = images_on_one_filesystem(
+            config_blob(
+                &["PATH=/bin", "NGINX_VERSION=1.27.5", "APP_PORT=8080"],
+                &[steps[0], steps[1], "ENV APP_PORT=8080"],
+            ),
+            "sha256:old",
+            config_blob(&["PATH=/bin", "NGINX_VERSION=1.27.5"], &steps),
+            format!(
+                "{IMAGE}\t{NEW_DIGEST}\tlinux/amd64\n\
+                 docker.io/backup/nginx:keep\tsha256:bk\tlinux/amd64\n"
+            ),
+        );
+        let listed = n.list_running().await.unwrap();
+        assert_eq!(listed[0].image_id, None, "not taken for the tag's image");
     }
 
     #[tokio::test]
