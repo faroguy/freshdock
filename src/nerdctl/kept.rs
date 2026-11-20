@@ -166,6 +166,13 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 /// rename it over `path`; then sync the directory, so the rename itself
 /// survives a crash. The caller holds the lock, so the temporary name can't
 /// clash with another freshdock process's.
+///
+/// Only a failure up to the rename is an error: the old contents are then
+/// still in place. Once renamed, the new contents are what every process
+/// reads, so a directory sync that fails after it is logged, not returned:
+/// the write stands, and only whether it would survive a crash is in doubt.
+/// Returning it would switch the store to memory while the file holds
+/// entries the memory doesn't.
 fn replace(path: &Path, dir: Option<&Path>, body: &[u8]) -> std::io::Result<()> {
     let tmp = sibling(path, &format!(".tmp-{}", std::process::id()));
     let written = (|| {
@@ -179,7 +186,14 @@ fn replace(path: &Path, dir: Option<&Path>, body: &[u8]) -> std::io::Result<()> 
     }
     written?;
     #[cfg(unix)]
-    std::fs::File::open(dir.unwrap_or(Path::new(".")))?.sync_all()?;
+    if let Err(e) = std::fs::File::open(dir.unwrap_or(Path::new("."))).and_then(|d| d.sync_all()) {
+        warn!(
+            path = %path.display(),
+            error = %e,
+            "the state file was written, but its directory could not be synced, so the \
+             change may not survive a crash"
+        );
+    }
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())

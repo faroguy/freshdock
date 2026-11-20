@@ -80,40 +80,69 @@ pub fn history(blob: &str) -> Vec<Value> {
 pub enum Target {
     /// A manifest, with its config's digest.
     Config(String),
-    /// An index: the manifests for the record's platform.
-    Manifests(Vec<String>),
+    /// An index: the manifests for the record's platform, and those whose
+    /// entry gives no platform (it is optional), which only their config can
+    /// place (see [`config_on`]).
+    Manifests(Vec<String>, Vec<String>),
+}
+
+/// `os/architecture[/variant]`, as `nerdctl images` prints it, normalised.
+fn wanted(platform: &str) -> (String, String, String) {
+    let mut parts = platform.split('/');
+    let os = parts.next().unwrap_or("");
+    let arch = parts.next().unwrap_or("");
+    normalise(os, arch, parts.next().unwrap_or(""))
 }
 
 /// Read a manifest or an index (`ctr content get <digest>`). For an index,
 /// only the manifests for `platform` (`os/architecture[/variant]`, as
-/// `nerdctl images` prints it) count; without one, all do.
+/// `nerdctl images` prints it) count; without one, all do. An entry with no
+/// platform is neither taken nor dropped: it is returned apart, to be
+/// decided by its config, as containerd does.
 pub fn target(blob: &str, platform: Option<&str>) -> Option<Target> {
     let blob: Value = serde_json::from_str(blob).ok()?;
     if let Some(config) = blob.pointer("/config/digest").and_then(Value::as_str) {
         return Some(Target::Config(config.to_owned()));
     }
     let manifests = blob.get("manifests")?.as_array()?;
-    let wanted = platform.map(|p| {
-        let mut parts = p.split('/');
-        let os = parts.next().unwrap_or("");
-        let arch = parts.next().unwrap_or("");
-        normalise(os, arch, parts.next().unwrap_or(""))
-    });
-    let picked = manifests
-        .iter()
-        .filter(|m| {
-            let field = |k: &str| {
-                m.pointer(&format!("/platform/{k}"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-            };
-            wanted.as_ref().is_none_or(|w| {
-                *w == normalise(field("os"), field("architecture"), field("variant"))
-            })
-        })
-        .filter_map(|m| m.get("digest")?.as_str().map(str::to_owned))
-        .collect();
-    Some(Target::Manifests(picked))
+    let wanted = platform.map(wanted);
+    let mut picked = Vec::new();
+    let mut unplaced = Vec::new();
+    for m in manifests {
+        let Some(digest) = m.get("digest").and_then(Value::as_str) else {
+            continue;
+        };
+        let field = |k: &str| {
+            m.pointer(&format!("/platform/{k}"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        };
+        match &wanted {
+            None => picked.push(digest.to_owned()),
+            Some(_) if m.get("platform").is_none_or(Value::is_null) => {
+                unplaced.push(digest.to_owned());
+            }
+            Some(w) if *w == normalise(field("os"), field("architecture"), field("variant")) => {
+                picked.push(digest.to_owned());
+            }
+            Some(_) => {}
+        }
+    }
+    Some(Target::Manifests(picked, unplaced))
+}
+
+/// Is the image config `blob` for `platform`? Its own `os`, `architecture`
+/// and `variant`, normalised; a config that names no platform is taken to be
+/// for any, as one listed under it.
+pub fn config_on(blob: &str, platform: &str) -> bool {
+    let Ok(blob) = serde_json::from_str::<Value>(blob) else {
+        return false;
+    };
+    let field = |k: &str| blob.get(k).and_then(Value::as_str).unwrap_or("");
+    if field("os").is_empty() && field("architecture").is_empty() {
+        return true;
+    }
+    wanted(platform) == normalise(field("os"), field("architecture"), field("variant"))
 }
 
 /// A platform in one spelling, as containerd's `platforms.Normalize` gives
@@ -128,6 +157,7 @@ fn normalise(os: &str, arch: &str, variant: &str) -> (String, String, String) {
         ("x86_64" | "x86-64" | "amd64", "v1") => ("amd64", String::new()),
         ("x86_64" | "x86-64" | "amd64", v) => ("amd64", v.to_owned()),
         ("aarch64" | "arm64", "8" | "v8" | "v8.0") => ("arm64", String::new()),
+        ("aarch64" | "arm64", "9" | "9.0" | "v9.0") => ("arm64", "v9".to_owned()),
         ("aarch64" | "arm64", v) => ("arm64", v.to_owned()),
         ("armhf", _) => ("arm", "v7".to_owned()),
         ("armel", _) => ("arm", "v6".to_owned()),
@@ -191,21 +221,41 @@ mod tests {
             {"digest":"sha256:arm","platform":{"architecture":"arm64","os":"linux"}}]}"#;
         assert_eq!(
             target(index, Some("linux/amd64")),
-            Some(Target::Manifests(vec!["sha256:amd".to_owned()]))
+            Some(Target::Manifests(vec!["sha256:amd".to_owned()], vec![]))
         );
         assert_eq!(
             target(index, Some("linux/arm64/v8")),
-            Some(Target::Manifests(vec!["sha256:arm".to_owned()]))
+            Some(Target::Manifests(vec!["sha256:arm".to_owned()], vec![]))
         );
         assert_eq!(
             target(index, None),
-            Some(Target::Manifests(vec![
-                "sha256:amd".to_owned(),
-                "sha256:att".to_owned(),
-                "sha256:arm".to_owned()
-            ]))
+            Some(Target::Manifests(
+                vec![
+                    "sha256:amd".to_owned(),
+                    "sha256:att".to_owned(),
+                    "sha256:arm".to_owned()
+                ],
+                vec![]
+            ))
         );
         assert_eq!(target("{}", None), None);
+    }
+
+    #[test]
+    fn an_index_entry_without_a_platform_is_left_to_its_config() {
+        // #115 review: `platform` is optional in an index.
+        let index = r#"{"manifests":[
+            {"digest":"sha256:arm","platform":{"architecture":"arm64","os":"linux"}},
+            {"digest":"sha256:bare"}]}"#;
+        assert_eq!(
+            target(index, Some("linux/amd64")),
+            Some(Target::Manifests(vec![], vec!["sha256:bare".to_owned()])),
+            "neither taken nor dropped: an explicit other platform still is"
+        );
+        let amd = r#"{"architecture":"amd64","os":"linux","config":{}}"#;
+        assert!(config_on(amd, "linux/amd64"));
+        assert!(!config_on(amd, "linux/arm64"));
+        assert!(config_on(r#"{"config":{}}"#, "linux/amd64"), "names none");
     }
 
     #[test]
@@ -215,11 +265,14 @@ mod tests {
             {"digest":"sha256:v6","platform":{"architecture":"arm","os":"linux","variant":"v6"}},
             {"digest":"sha256:v7","platform":{"architecture":"arm","os":"linux","variant":"v7"}},
             {"digest":"sha256:a64","platform":{"architecture":"arm64","os":"linux","variant":"v8"}},
+            {"digest":"sha256:a649","platform":{"architecture":"arm64","os":"linux","variant":"v9.0"}},
             {"digest":"sha256:amd","platform":{"architecture":"amd64","os":"linux"}}]}"#;
         let picked = |platform| match target(index, Some(platform)) {
-            Some(Target::Manifests(m)) => m,
+            Some(Target::Manifests(m, _)) => m,
             other => panic!("{other:?}"),
         };
+        assert_eq!(picked("linux/arm64/v9"), ["sha256:a649"], "v9.0 is v9");
+        assert_eq!(picked("linux/arm64/9"), ["sha256:a649"]);
         assert_eq!(picked("linux/arm/v6"), ["sha256:v6"]);
         assert_eq!(picked("linux/arm/v7"), ["sha256:v7"]);
         assert_eq!(picked("linux/arm"), ["sha256:v7"], "arm means arm/v7");

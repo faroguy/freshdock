@@ -278,8 +278,9 @@ logs both.
   `freshdock check` reads the same notes, and tells a container it has no note
   for from its filesystem in the same way, so it reports each container by the
   image it runs, as the daemon does: a sibling left behind a shared tag shows
-  as behind it. It also writes the notes it makes on first sight to the state
-  file, the same ones the daemon would write. It changes nothing else.
+  as behind it. It also keeps the state file current, as the daemon does: it
+  writes the notes it makes on first sight, and removes those of containers
+  that nerdctl confirms are gone. It removes no container or image.
 
   If containerd can't be asked about a container's image (it is restarting,
   say), freshdock asks again on the next pass, and until it has an answer it
@@ -297,7 +298,9 @@ logs both.
   one-off `freshdock recreate`, doesn't lose track of them: the daemon removes
   them on a later pass. Names you made yourself are never touched. Both state
   files are replaced whole on every change, under a lock on a `.lock` file next
-  to them, so a write that fails (a full disk, say) leaves them as they were.
+  to them, so a write that fails (a full disk, say) leaves them as they were. A
+  failure only after the new file is in place (syncing its directory) is logged:
+  the change stands, but may not survive a crash.
 - **Registry credentials** from freshdock's configuration are passed to
   `nerdctl pull` through a temporary, owner-only `DOCKER_CONFIG`. Without them,
   nerdctl's own login (`nerdctl login`) is used. See

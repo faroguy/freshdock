@@ -117,6 +117,8 @@ pub struct ImageConfig {
     pub stop_signal: Option<String>,
     pub entrypoint: Option<Vec<String>>,
     pub cmd: Option<Vec<String>>,
+    /// Read by [`from_blob`](Self::from_blob), in any case, not by serde.
+    #[serde(skip)]
     healthcheck: Option<Healthcheck>,
 }
 
@@ -141,14 +143,18 @@ impl ImageConfig {
             Some(section) => section,
         };
         let mut config: Self = serde_json::from_value(section.clone()).ok()?;
-        if config.healthcheck.is_none() {
-            config.healthcheck = section
-                .as_object()
-                .into_iter()
-                .flatten()
-                .find(|(k, v)| k.eq_ignore_ascii_case("healthcheck") && !v.is_null())
-                .and_then(|(_, v)| healthcheck_in_any_case(v));
-        }
+        // The exact spelling first, then any other; members in any case too.
+        let fields = section.as_object();
+        config.healthcheck = fields
+            .and_then(|f| f.get("Healthcheck"))
+            .filter(|v| !v.is_null())
+            .or_else(|| {
+                fields?
+                    .iter()
+                    .find(|(k, v)| k.eq_ignore_ascii_case("healthcheck") && !v.is_null())
+                    .map(|(_, v)| v)
+            })
+            .and_then(healthcheck_in_any_case);
         if config.healthcheck.is_none() {
             config.healthcheck = config
                 .labels
@@ -1499,12 +1505,18 @@ mod tests {
     fn nginx_config() -> ImageConfig {
         let image: Vec<Value> =
             serde_json::from_str(&fixture("nerdctl_image_inspect.json")).unwrap();
-        serde_json::from_value(image[0]["Config"].clone()).unwrap()
+        config_section(image[0]["Config"].clone())
+    }
+
+    /// The image config whose blob has `section` as its `config`, read the
+    /// way freshdock reads it.
+    fn config_section(section: Value) -> ImageConfig {
+        ImageConfig::from_blob(&serde_json::json!({ "config": section }).to_string()).unwrap()
     }
 
     /// A container built from JSON, against an image config built from JSON.
     fn against(compat: Value, native: Value, image: Value) -> NerdctlSpec {
-        let image: ImageConfig = serde_json::from_value(image).unwrap();
+        let image = config_section(image);
         NerdctlSpec::from_inspect(
             serde_json::from_value(compat).unwrap(),
             serde_json::from_value(native).unwrap(),
@@ -1805,6 +1817,15 @@ mod tests {
             );
             assert_eq!(check.interval, Some(5_000_000_000), "{key}");
         }
+        // The exact outer spelling with lowercase members (#115 review): an
+        // exec-form check the image gives, not one of the container's own.
+        let exact = r#"{"config":{"Healthcheck":{"test":["CMD","/probe"],"retries":2}}}"#;
+        let check = ImageConfig::from_blob(exact).unwrap().healthcheck.unwrap();
+        assert_eq!(
+            check.test,
+            Some(vec!["CMD".to_owned(), "/probe".to_owned()])
+        );
+        assert_eq!(check.retries, Some(2));
         // Neither, or a label nerdctl couldn't read either: none.
         assert_eq!(test_of(r#"{"config":{"Labels":{"a":"b"}}}"#), None);
         assert_eq!(

@@ -1103,11 +1103,26 @@ impl<R: CommandRunner> Nerdctl<R> {
         let blob = self.blob(digest).await?;
         Ok(match snapshot::target(&blob, platform) {
             Some(snapshot::Target::Config(c)) => vec![c],
-            Some(snapshot::Target::Manifests(manifests)) => {
+            Some(snapshot::Target::Manifests(manifests, unplaced)) => {
                 let mut configs = Vec::new();
                 for manifest in manifests {
                     let blob = self.blob(&manifest).await?;
                     if let Some(snapshot::Target::Config(c)) = snapshot::target(&blob, platform) {
+                        configs.push(c);
+                    }
+                }
+                // Entries with no platform: their config says which it is.
+                for manifest in unplaced {
+                    let blob = self.blob(&manifest).await?;
+                    let Some(snapshot::Target::Config(c)) = snapshot::target(&blob, platform)
+                    else {
+                        continue;
+                    };
+                    let on_platform = match platform {
+                        Some(p) => snapshot::config_on(&self.blob(&c).await?, p),
+                        None => true,
+                    };
+                    if on_platform {
                         configs.push(c);
                     }
                 }
@@ -1127,6 +1142,12 @@ impl<R: CommandRunner> Nerdctl<R> {
     /// [`history_extends`]), and no name of this repository has it. Returns
     /// those left, each with a digest reference of the repository's when it
     /// has one.
+    ///
+    /// The one case this decides wrongly: an old release that only another
+    /// repository names now, where the new release only appended steps that
+    /// add no layers (a `LABEL` at the end, say). Its history is then where
+    /// the new one's begins, so it passes for the new one's base and is ruled
+    /// out, though the container may run it.
     ///
     /// `Err` when the images can't be listed, or a blob can't be read for a
     /// reason that may pass. An image whose blobs containerd doesn't have is
