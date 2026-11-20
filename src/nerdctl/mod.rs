@@ -1117,14 +1117,25 @@ impl<R: CommandRunner> Nerdctl<R> {
                     }
                 }
                 // Entries with no platform: their config says which it is.
+                // One containerd doesn't have (it wasn't for this platform,
+                // so it was never pulled) is passed over, keeping what was
+                // found; a read that may pass still fails the lot.
                 for manifest in unplaced {
-                    let blob = self.blob(&manifest).await?;
+                    let blob = match self.blob(&manifest).await {
+                        Ok(blob) => blob,
+                        Err(BlobError::Missing(_)) => continue,
+                        Err(e) => return Err(e),
+                    };
                     let Some(snapshot::Target::Config(c)) = snapshot::target(&blob, platform)
                     else {
                         continue;
                     };
                     let on_platform = match platform {
-                        Some(p) => snapshot::config_on(&self.blob(&c).await?, p),
+                        Some(p) => match self.blob(&c).await {
+                            Ok(config) => snapshot::config_on(&config, p),
+                            Err(BlobError::Missing(_)) => false,
+                            Err(e) => return Err(e),
+                        },
                         None => true,
                     };
                     if on_platform {
@@ -1382,14 +1393,26 @@ impl<R: CommandRunner> Nerdctl<R> {
                     spec.image_ref
                 )
             }),
+            // As `local_image` will decide for the repair's create: a record
+            // on the wrong image is refused there before another name is
+            // tried, so it is refused here too.
             (_, Some(pinned)) => {
                 let on_tag = now.pinned.as_deref().and_then(digest_of).is_some()
                     && now.pinned.as_deref().and_then(digest_of) == digest_of(pinned);
-                let local = on_tag
-                    || self.record_state(pinned).await? == Record::Good
-                    || self.other_name_of(pinned).await.is_some();
-                (!local)
-                    .then(|| format!("the image it runs, {pinned}, is no longer available locally"))
+                if on_tag {
+                    None
+                } else {
+                    match self.record_state(pinned).await? {
+                        Record::Good => None,
+                        Record::Wrong(target) => Some(format!(
+                            "the image record {pinned} it runs from points at {target}"
+                        )),
+                        Record::Missing if self.other_name_of(pinned).await.is_some() => None,
+                        Record::Missing => Some(format!(
+                            "the image it runs, {pinned}, is no longer available locally"
+                        )),
+                    }
+                }
             }
         };
         Ok(missing)
@@ -2722,8 +2745,15 @@ mod tests {
                 )
                 .on("pull --quiet library/nginx:alpine", ok("")),
         );
+        // A container runs the image, so keeping it is considered at all.
+        seen_running_old(&n, &[PLAIN_ID]);
         n.pull(&ImageRef::parse("nginx:alpine")).await.unwrap();
-        assert!(!n.runner.calls().iter().any(|c| c.starts_with("tag ")));
+        let calls = n.runner.calls();
+        assert!(
+            calls.contains(&"images --no-trunc --format {{.Name}}\t{{.Digest}}".to_owned()),
+            "the existing record was looked at: {calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.starts_with("tag ")));
         assert!(n.kept.names().is_empty(), "not freshdock's to remove later");
     }
 
@@ -4607,6 +4637,60 @@ mod tests {
         assert!(
             msg.contains(&format!("{gone}, is no longer available")),
             "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dependents_wrong_record_refuses_the_owner_even_with_another_name() {
+        // #115 review: the repair's create refuses the wrong record before it
+        // would look for another name, so preflight must not let it through.
+        let old = format!("docker.io/library/alpine@{OLD_DIGEST}");
+        let err = dependent_check(
+            Seen {
+                id: Some("sha256:old".to_owned()),
+                pinned: Some(old.clone()),
+            },
+            owner_with_dependent(serde_json::json!(["PATH=/bin"])).on(
+                "images --no-trunc --format {{.Name}}\t{{.Digest}}",
+                ok(format!(
+                    "{old}\t{NEW_DIGEST}\n\
+                     docker.io/library/alpine:keep\t{OLD_DIGEST}\n"
+                )),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(&format!("points at {NEW_DIGEST}")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_child_without_a_platform_keeps_the_config_found() {
+        let mut n = nerdctl(FakeRunner::default());
+        n.ctr = Some(
+            FakeRunner::default()
+                .on(
+                    "content get sha256:index",
+                    ok(r#"{"manifests":[
+                        {"digest":"sha256:amd","platform":{"architecture":"amd64","os":"linux"}},
+                        {"digest":"sha256:bare"}]}"#),
+                )
+                .on(
+                    "content get sha256:amd",
+                    ok(r#"{"config":{"digest":"sha256:cfg"}}"#),
+                )
+                .on(
+                    "content get sha256:bare",
+                    fail("ctr: content digest sha256:bare: not found"),
+                ),
+        );
+        assert_eq!(
+            n.configs_of("sha256:index", Some("linux/amd64"))
+                .await
+                .unwrap(),
+            ["sha256:cfg"]
         );
     }
 
