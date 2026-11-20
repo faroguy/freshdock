@@ -1255,10 +1255,21 @@ async fn a_stopped_container_keeps_its_image_note() {
     #[rustfmt::skip]
     must(&["run", "-d", "--name", &name, "--label", "freshdock.enable=true", tag]);
     n.list_running().await.unwrap();
+    // This run's v1, by the name freshdock keeps it under: a leftover of an
+    // earlier run in the same repository must not pass for it.
+    let kept_v1 = format!(
+        "127.0.0.1:15006/freshdock-live/stopped@{}",
+        image_digest(tag)
+    );
     build_and_publish(&v2, tag);
     n.pull(&freshdock::registry::ImageRef::parse(tag))
         .await
         .expect("pull v2");
+    assert!(
+        digest_records().contains(&kept_v1),
+        "v1 kept before the tag moved: {:?}",
+        digest_records()
+    );
     must(&["stop", &name]);
     n.list_running().await.unwrap();
     drop(n);
@@ -1269,9 +1280,7 @@ async fn a_stopped_container_keeps_its_image_note() {
     n.sweep_or_warn().await;
     n.list_running().await.unwrap();
     assert!(
-        digest_records()
-            .iter()
-            .any(|r| r.starts_with("127.0.0.1:15006/freshdock-live/stopped@")),
+        digest_records().contains(&kept_v1),
         "v1 is still kept: {:?}",
         digest_records()
     );
